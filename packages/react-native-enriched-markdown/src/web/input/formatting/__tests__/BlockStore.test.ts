@@ -34,6 +34,22 @@ describe('paragraphBounds', () => {
     expect(paragraphBounds(-5, 999, text)).toEqual({ start: 0, end: 21 });
     expect(paragraphBounds(3, 3, '')).toEqual({ start: 0, end: 0 });
   });
+
+  it('does not treat a leading newline as the end of a line before position 0', () => {
+    expect(paragraphBounds(0, 0, '\nab')).toEqual({ start: 0, end: 0 });
+    expect(paragraphBounds(1, 1, '\nab')).toEqual({ start: 1, end: 3 });
+  });
+
+  it('resolves positions between consecutive newlines to their empty lines', () => {
+    // 'a\n\n\nb': position 1 ends line "a"; 2 and 3 are the empty lines.
+    expect(paragraphBounds(1, 1, 'a\n\n\nb')).toEqual({ start: 0, end: 1 });
+    expect(paragraphBounds(2, 2, 'a\n\n\nb')).toEqual({ start: 2, end: 2 });
+    expect(paragraphBounds(3, 3, 'a\n\n\nb')).toEqual({ start: 3, end: 3 });
+  });
+
+  it('resolves the end of text after a trailing newline to the empty last line', () => {
+    expect(paragraphBounds(3, 3, 'ab\n')).toEqual({ start: 3, end: 3 });
+  });
 });
 
 describe('lineAtPosition', () => {
@@ -119,6 +135,25 @@ describe('BlockStore', () => {
     store.setRanges([block('h1', 0, 9)]);
 
     expect(store.blockAt(19, text)).toBeNull();
+  });
+
+  it('blockAt finds an anchor on an empty line and the block at the end of text', () => {
+    store.setRanges([
+      block('unordered-list-item', 17, 17),
+      block('h2', 18, 21),
+    ]);
+
+    expect(store.blockAt(17, text)?.type).toBe('unordered-list-item');
+    expect(store.blockAt(21, text)?.type).toBe('h2');
+    expect(store.blockAt(999, text)?.type).toBe('h2');
+  });
+
+  it('blockAt at position 0 ignores a leading newline', () => {
+    store.setRanges([block('h1', 0, 0), block('h2', 1, 3)]);
+
+    expect(store.blockAt(0, '\nab')?.type).toBe('h1');
+    expect(store.blockAt(-3, '\nab')?.type).toBe('h1');
+    expect(store.blockAt(1, '\nab')?.type).toBe('h2');
   });
 
   it('blockStartingAt finds the block by its exact line start', () => {
@@ -508,6 +543,41 @@ describe('BlockStore', () => {
 
       expect(store.allRanges.map((r) => r.ordinal)).toEqual([1, 2]);
     });
+  });
+
+  it('pruneOrphanedAnchors drops anchored blocks left mid-line and keeps line starts', () => {
+    // "ab\ncd": a heading merged into line 1 at 1, a list item at text start
+    // and one right after the newline.
+    store.setRanges([
+      block('unordered-list-item', 0, 1),
+      block('h1', 1, 2),
+      block('ordered-list-item', 3, 5),
+    ]);
+
+    store.pruneOrphanedAnchors('ab\ncd');
+
+    expect(store.allRanges.map((r) => [r.type, r.start])).toEqual([
+      ['unordered-list-item', 0],
+      ['ordered-list-item', 3],
+    ]);
+  });
+
+  it('pruneOrphanedAnchors leaves non-anchored blocks wherever they start', () => {
+    store.setRanges([block('paragraph', 1, 2)]);
+
+    store.pruneOrphanedAnchors('ab');
+
+    expect(store.allRanges).toHaveLength(1);
+  });
+
+  it('pruneOrphanedAnchors judges an anchor past the text at the text end', () => {
+    store.setRanges([block('h1', 9, 9)]);
+    store.pruneOrphanedAnchors('ab\n');
+    expect(store.allRanges).toHaveLength(1);
+
+    store.setRanges([block('h1', 9, 9)]);
+    store.pruneOrphanedAnchors('ab');
+    expect(store.allRanges).toHaveLength(0);
   });
 
   it('setRanges sorts incoming blocks by start', () => {

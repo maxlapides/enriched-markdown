@@ -11,6 +11,8 @@ import { sortedInsertionIndex } from './rangeStoreUtils';
 import { clamp, firstIndexReachingTarget } from '../utils';
 import type { RangeBounds } from '../model/rangeBounds';
 
+const NEWLINE = 10;
+
 // Expands a selection to cover whole lines (line-scoped block boundaries).
 export function paragraphBounds(
   rangeStart: number,
@@ -24,15 +26,23 @@ export function paragraphBounds(
   const clampedStart = clamp(rangeStart, 0, text.length);
   const clampedEnd = clamp(rangeEnd, clampedStart, text.length);
 
-  let start = clampedStart;
-  while (start > 0 && text[start - 1] !== '\n') {
-    start--;
-  }
-  let end = clampedEnd;
-  while (end < text.length && text[end] !== '\n') {
-    end++;
-  }
-  return { start, end };
+  const nextNewline = text.indexOf('\n', clampedEnd);
+  return {
+    start: lineStartBefore(clampedStart, text),
+    end: nextNewline === -1 ? text.length : nextNewline,
+  };
+}
+
+// Start of the line holding `position`, which must already be in
+// [0, text.length]. Guarded at 0 because `lastIndexOf` clamps a negative
+// `fromIndex` to 0 and would match a leading newline.
+function lineStartBefore(position: number, text: string): number {
+  return position === 0 ? 0 : text.lastIndexOf('\n', position - 1) + 1;
+}
+
+// Whether `position` (in [0, text.length]) begins a line.
+function isLineStart(position: number, text: string): boolean {
+  return position === 0 || text.charCodeAt(position - 1) === NEWLINE;
 }
 
 // The line containing `position`.
@@ -144,8 +154,7 @@ export class BlockStore {
       if (!ANCHORED_BLOCK_TYPES.has(range.type)) {
         return true;
       }
-      const anchor = clamp(range.start, 0, text.length);
-      return paragraphBounds(anchor, anchor, text).start === anchor;
+      return isLineStart(clamp(range.start, 0, text.length), text);
     });
     if (kept.length === this.ranges.length) {
       return;
@@ -325,7 +334,9 @@ export class BlockStore {
 
   // The block on the line containing `position`, if any.
   blockAt(position: number, text: string): BlockRange | null {
-    return this.blockStartingAt(lineAtPosition(position, text).start);
+    return this.blockStartingAt(
+      lineStartBefore(clamp(position, 0, text.length), text)
+    );
   }
 
   // Starts are unique (one block per paragraph), so the first range reaching
