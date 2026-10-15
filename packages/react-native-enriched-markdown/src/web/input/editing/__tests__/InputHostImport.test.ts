@@ -165,4 +165,19 @@ describe('InputHost imports', () => {
     expect(host.value).toBe('loaded');
     expect(root.textContent).toBe('loaded');
   });
+
+  // The wrapper's import queue waits on this promise; a dropped one stalls
+  // every command and `getMarkdown` behind it.
+  it('an import waiting on a composition settles when the host is destroyed', async () => {
+    const { root, host } = mount();
+    root.focus();
+    const finish = deferParse('loaded');
+    const importing = host.setValue('loaded');
+    root.dispatchEvent(new Event('compositionstart', { bubbles: true }));
+    await finish();
+    host.destroy();
+
+    await expect(importing).resolves.toBeUndefined();
+    expect(host.value).toBe('');
+  });
 });

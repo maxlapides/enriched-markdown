@@ -11,12 +11,9 @@ const LOG_PREFIX = '[EnrichedMarkdown - DomRenderer]';
 // in these nodes, so existing nodes are mutated rather than replaced; nodes
 // are added or removed only when the paragraph/run structure changes.
 //
-// The renderer owns its line elements: `lines` holds them in projection
-// order, and every patch addresses a line by reference rather than by its
-// position among the root's children. The browser can merge, split or drop
-// lines under an IME, and an extension can insert nodes of its own; indexing
-// `root.children` would then patch or remove the wrong line. A root whose
-// children no longer match `lines` is rebuilt instead of patched.
+// Lines are patched by reference through `lines`, not by position under the
+// root, which an IME or an extension can change. A root that no longer
+// matches `lines` is rebuilt.
 export class DomRenderer {
   private readonly root: HTMLElement;
   private renderedText = '';
@@ -74,10 +71,8 @@ export class DomRenderer {
       : -1;
   }
 
-  // Marks the lines in [from, to] as written by someone else, so the next
-  // render rewrites them even where the model shows no change. A composition
-  // records the lines it started over; whatever the IME leaves in them -
-  // split text nodes, styled spans, stray text - is the model's to replace.
+  // Lines [from, to] were written by someone else (an IME); the next render
+  // rewrites them even where the model did not change.
   markLinesDirty(from: number, to: number): void {
     for (let i = Math.max(from, 0); i <= to && i < this.lines.length; i++) {
       this.dirtyLines.add(this.lines[i]!);
@@ -181,12 +176,9 @@ export class DomRenderer {
     this.renderedParagraphs = [...paragraphs];
   }
 
-  // Whether the root still holds exactly the lines this renderer wrote, as
-  // far as the coming patch depends on: nothing added or removed under the
-  // root, and every line the patch touches - plus the one it inserts before -
-  // still a child of it. A full walk would cost O(lines) per keystroke; the
-  // count catches anything added or dropped, and the window covers a line
-  // swapped for a foreign node.
+  // Whether the patch can trust `lines`: the child count catches additions
+  // and removals, and the patched window is checked for swapped lines. Not
+  // a full walk, which would cost O(lines) per keystroke.
   private linesIntact(start: number, stalePairs: number): boolean {
     if (this.root.childNodes.length !== this.lines.length) {
       return false;
@@ -331,11 +323,8 @@ function patchParagraph(
   });
 }
 
-// A run span as `createRun` builds them: exactly one text node inside, which
-// is what `patchRun` writes through, and no attributes but the ones
-// `patchRun` manages. An IME or the browser's own editing can leave a span
-// with an inline `style` (or a `<font>`) behind, and reusing it would keep
-// that styling on text the model says is plain.
+// A run span as `createRun` builds them: one text node, and only the
+// attributes `patchRun` manages - an IME can leave an inline `style` behind.
 export function isReusableRun(node: Node): boolean {
   if (
     node.nodeName !== 'SPAN' ||
@@ -410,10 +399,8 @@ function patchRun(span: HTMLElement, text: string, run: StyleRun): void {
   }
 }
 
-// Rewrites only the window that differs, rather than assigning `nodeValue`.
-// A whole-value assignment collapses a live caret in the node to offset 0 and
-// drops Blink's spellcheck markers on the untouched words; `replaceData` over
-// the edit keeps both, and leaves a caret before a deletion where it was.
+// `replaceData` over the changed window, not a `nodeValue` assignment, which
+// collapses a live caret to 0 and drops Blink's spellcheck markers.
 function replaceChangedData(node: Text, current: string, next: string): void {
   const maxShared = Math.min(current.length, next.length);
   let prefix = 0;

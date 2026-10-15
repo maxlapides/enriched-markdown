@@ -375,6 +375,25 @@ describe('selection direction', () => {
   });
 });
 
+describe('select-all on an empty editor', () => {
+  // Chrome selects the empty line's `<br>` and paints it as a range, while
+  // the range it exposes is collapsed; only `type` tells them apart.
+  it('replaces the phantom range with a caret', () => {
+    const { root } = mount();
+    root.focus();
+    const selection = document.getSelection()!;
+    const line = root.firstElementChild!;
+    selection.setBaseAndExtent(line, 0, line, 0);
+    const type = jest.spyOn(selection, 'type', 'get').mockReturnValue('Range');
+    const write = jest.spyOn(selection, 'setBaseAndExtent');
+    document.dispatchEvent(new Event('selectionchange'));
+
+    expect(write).toHaveBeenCalledWith(line, 0, line, 0);
+    type.mockRestore();
+    write.mockRestore();
+  });
+});
+
 describe('selection-only paths', () => {
   it('a caret toggle reports state but not markdown', () => {
     const { root, host, markdowns, states } = mount();
@@ -443,6 +462,29 @@ describe('links are atomic', () => {
 
     expect(host.value).toBe(' tail');
     expect(host.getMarkdown()).toBe(' tail');
+  });
+
+  it('keeps a backward selection backward when widening it', async () => {
+    const { root, selections } = await mountWithLink();
+    const from = domPointAt(root, 7);
+    const to = domPointAt(root, 2);
+    document
+      .getSelection()!
+      .setBaseAndExtent(from.node, from.offset, to.node, to.offset);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    expect(selections.at(-1)).toEqual({ start: 0, end: 7 });
+    const selection = document.getSelection()!;
+    const anchor = domPointAt(root, 7);
+    const focus = domPointAt(root, 0);
+    expect([selection.anchorNode, selection.anchorOffset]).toEqual([
+      anchor.node,
+      anchor.offset,
+    ]);
+    expect([selection.focusNode, selection.focusOffset]).toEqual([
+      focus.node,
+      focus.offset,
+    ]);
   });
 });
 

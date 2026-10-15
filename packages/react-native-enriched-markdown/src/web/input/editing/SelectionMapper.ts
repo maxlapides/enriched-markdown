@@ -5,19 +5,15 @@ export interface DomPosition {
   offset: number;
 }
 
-// A DOM selection in model offsets, with its direction kept: `anchor` is
-// where it started and `focus` the end that moves. Reducing it to min/max
-// would flip a backward selection forward on the next write, and Shift+Arrow
-// would then extend the wrong end.
+// A DOM selection in model offsets, direction kept so a backward selection
+// is not flipped on the next write.
 export interface ModelSelectionPoints {
   anchor: number;
   focus: number;
 }
 
-// The lines of the DOM as currently rendered. Supplied by the renderer rather
-// than copied here: `render` is the only thing that maintains the
-// correspondence between the lines and the nodes, so the copy that matches
-// the nodes is the one to index against.
+// The lines as currently rendered. Supplied by the renderer, the only thing
+// that keeps lines and nodes in step.
 export interface RenderedLines {
   readonly lineCount: number;
   lineStart(index: number): number;
@@ -25,6 +21,13 @@ export interface RenderedLines {
   lineElement(index: number): HTMLElement | undefined;
   // -1 for a node that is not a rendered line.
   indexOfLine(node: Node): number;
+}
+
+// Whether the DOM selection is a caret. Not `isCollapsed` alone: Cmd+A in an
+// empty line selects its `<br>`, which Chrome paints as a range while
+// exposing a collapsed one (`type` is 'Range').
+export function isCaret(selection: Selection): boolean {
+  return selection.isCollapsed && selection.type !== 'Range';
 }
 
 const LOG_PREFIX = '[EnrichedMarkdown - SelectionMapper]';
@@ -43,13 +46,9 @@ function reportDesync(message: string): void {
 // Translates DOM positions to buffer offsets and back over the renderer's
 // lines: one element per line, directly under the root.
 //
-// Within a line both directions count text, not nodes: an offset is the
-// length of the line's text before the point. That is what the line shows
-// whatever shape its nodes are in - a run split into two text nodes by an
-// IME, a point addressed by element inside a span (a spellcheck target
-// range), a foreign wrapper - so a non-canonical line costs nothing worse
-// than the text it actually holds. A run-boundary offset maps to the start of
-// the following run.
+// Within a line both directions count text, not nodes, so split text nodes,
+// element-addressed points and foreign wrappers all map by what the line
+// shows. A run-boundary offset maps to the start of the following run.
 export class SelectionMapper {
   private readonly root: HTMLElement;
   private readonly lines: RenderedLines;
@@ -145,9 +144,8 @@ export class SelectionMapper {
     return focus === null ? null : { anchor, focus };
   }
 
-  // The root addresses a position by child-node index. The index one past the
-  // last child is the legitimate "after everything" position; any other lands
-  // on the start of the line at or after it.
+  // A child-node index: past the last child is the document end, anything
+  // else the start of the line at or after it.
   private offsetOfRootPoint(offset: number): number | null {
     const children = this.root.childNodes;
     if (offset >= children.length) {
@@ -195,10 +193,8 @@ function textLengthBefore(line: Element, node: Node, offset: number): number {
   return range.toString().length;
 }
 
-// Walks a line's text nodes to the DOM position `offset` units in. Returns
-// null when the line holds less text than the projection claims, rather than
-// the plausible-looking line start: a line-start answer reads as a real
-// position to every caller, and the caret belongs where the text is.
+// The DOM position `offset` units into a line; null when the line holds less
+// text than projected, rather than a plausible but wrong line start.
 function positionInLine(line: Element, offset: number): DomPosition | null {
   const walker = line.ownerDocument.createTreeWalker(
     line,

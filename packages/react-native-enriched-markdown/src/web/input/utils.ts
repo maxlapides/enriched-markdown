@@ -99,10 +99,8 @@ const graphemeSegmenter: GraphemeSegmenter | null = (() => {
 // backspace uses `TextUtils.getOffsetBefore`); web has to compute the step
 // itself, so it segments instead.
 //
-// Segmentation runs from the start of the line. A cluster never crosses a
-// newline, so that is the nearest point known to be a boundary; any later
-// starting point can be one, and a run of flags read from its middle pairs
-// the regional indicators the wrong way round.
+// Segmentation starts at the line start, the nearest known boundary: from
+// the middle of a run of flags it pairs regional indicators wrongly.
 export function graphemeLengthBefore(text: string, position: number): number {
   if (position <= 0) {
     return 0;

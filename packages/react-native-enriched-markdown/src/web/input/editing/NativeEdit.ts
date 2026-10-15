@@ -1,21 +1,18 @@
 import { classNameFor, isReusableRun } from '../render/DomRenderer';
 import type { StyleRun } from '../render/InputProjection';
+import { isCaret } from './SelectionMapper';
 
-// An edit the browser is left to perform itself, inside one run's text node.
+// An edit the browser performs itself, inside one run's text node.
 //
-// Every other edit is cancelled at `beforeinput` and rendered from the model,
-// which rewrites the text node and so has to restore the caret by script
-// afterwards - a forced layout plus `setBaseAndExtent`, which is most of a
-// keystroke's cost on a long document and grows with it. Plain typing and a
-// one-character delete inside a run need neither: the browser's own edit
-// produces exactly the DOM the model would render, and leaves the caret where
-// the model puts it. Letting it through also keeps Blink's spellcheck markers
-// on the word being typed.
+// Every other edit is cancelled and rendered from the model, which then has
+// to restore the caret by script - most of a keystroke's cost on a long
+// document. For plain typing and single deletes inside a run the browser's
+// own edit already is the DOM the model would render, with the caret in
+// place and spellcheck markers kept.
 //
-// The decision is made by prediction: what the text node will hold once the
-// browser is done (`nodeText`), checked against the model's own runs for the
-// line before the event is let through, and checked against the DOM again
-// once `input` reports the edit happened.
+// `nodeText` predicts the text node after the edit; it is checked against
+// the model's runs before the event is let through, and against the DOM on
+// `input`.
 export interface NativeEdit {
   editStart: number;
   deletedText: string;
@@ -32,9 +29,8 @@ export interface NativeEditContext {
   modelOffsetFromDom(node: Node, offset: number): number | null;
 }
 
-// The edit `event` would make if the browser performed it, where that edit
-// stays inside a single canonical run's text node; null for everything else,
-// which takes the cancel-and-render path.
+// The edit `event` would make, if it stays inside one canonical run's text
+// node; null otherwise.
 export function planNativeEdit(
   event: InputEvent,
   context: NativeEditContext
@@ -61,7 +57,7 @@ function planInsert(
     return null;
   }
   const selection = context.root.ownerDocument.getSelection();
-  if (selection === null || !selection.isCollapsed) {
+  if (selection === null || !isCaret(selection)) {
     return null;
   }
   // A correction that addresses its own range replaces text elsewhere.
@@ -89,9 +85,8 @@ function planInsert(
   };
 }
 
-// Only with a target range: what one Backspace removes is the platform's
-// call (a cluster, or a single code point after some scripts), and taking the
-// browser's edit means taking its range too.
+// Needs a target range: taking the browser's edit means taking its idea of
+// what one Backspace removes.
 function planDelete(
   event: InputEvent,
   context: NativeEditContext
@@ -100,7 +95,7 @@ function planDelete(
   const target = firstTargetRange(event);
   if (
     selection === null ||
-    !selection.isCollapsed ||
+    !isCaret(selection) ||
     target === null ||
     target.collapsed ||
     target.startContainer !== target.endContainer
@@ -154,14 +149,9 @@ function firstTargetRange(event: InputEvent): StaticRange | null {
   return event.getTargetRanges()[0] ?? null;
 }
 
-// Whether the line's spans, with the planned edit applied to its text node,
-// are exactly what the model now projects for the line: the same runs, the
-// same styles, the same text. `runs` and `text` are the model after the edit.
-//
-// This is the whole eligibility rule. A pending style toggle, a link that
-// does not extend, a caret on a run boundary where the model and the browser
-// pick different spans, a delete that empties a run - each makes the runs
-// differ, and the edit is rendered from the model instead.
+// Whether the line's spans, with the edit applied, are exactly the model's
+// runs after it. This is the whole eligibility rule: pending styles, links,
+// run-boundary carets and emptied runs all fail it.
 export function spansMatchRuns(
   edit: NativeEdit,
   runs: readonly StyleRun[],
@@ -190,9 +180,7 @@ export function spansMatchRuns(
   return true;
 }
 
-// Whether the browser did what was planned: the same text node, alone in the
-// same span, in the same line, holding the predicted text, and no other node
-// added to the line.
+// Whether the browser did exactly what was planned, and nothing else.
 export function nativeEditLanded(
   edit: NativeEdit,
   isLine: (node: Node) => boolean,
