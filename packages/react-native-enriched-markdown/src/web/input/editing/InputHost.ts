@@ -3,12 +3,19 @@ import { FormattingStore } from '../formatting/FormattingStore';
 import { parseToPlainTextAndRanges } from '../formatting/InputParser';
 import { serialize } from '../formatting/MarkdownSerializer';
 import type { RangeBounds } from '../model/rangeBounds';
+import type { TextEdit } from '../model/textEdit';
 import { DomRenderer } from '../render/DomRenderer';
 import { computeStyleRuns, projectParagraphs } from '../render/InputProjection';
 import { ENRM_INPUT_CLASS, injectInputStyles } from '../render/inputStyles';
 import { isListItem, type BlockType } from '../model/blocks';
 import type { PendingStyleType } from '../model/inlineStyles';
 import { BlockEditCoordinator } from './BlockEditCoordinator';
+import {
+  EditHistory,
+  type EditKind,
+  type HistoryState,
+  type ModelSnapshot,
+} from './EditHistory';
 import { EditPipeline } from './EditPipeline';
 import { EditSession } from './EditSession';
 import {
@@ -41,6 +48,7 @@ export interface InputHostCallbacks {
   onChangeSelection?: (selection: RangeBounds) => void;
   onChangeState?: (state: InputState) => void;
   onChangeMarkdown?: (markdown: string) => void;
+  onChangeHistoryState?: (state: HistoryState) => void;
 }
 
 export interface InputHostOptions {
@@ -56,6 +64,7 @@ export class InputHost {
   private readonly formattingStore = new FormattingStore();
   private readonly blockStore = new BlockStore();
   private readonly session = new EditSession();
+  private readonly history = new EditHistory();
   private readonly pipeline: EditPipeline;
   private readonly blockCoordinator: BlockEditCoordinator;
   private readonly typing: TypingAttributesController;
@@ -91,6 +100,11 @@ export class InputHost {
   private editable = true;
   private markdownEmitEnabled = true;
   private lastEmittedState: InputState | null = null;
+  private lastEmittedHistory: HistoryState = { canUndo: false, canRedo: false };
+  // WebKit raises one `historyUndo` per entry on its own stack for a single
+  // Undo command once a scripted render has split that stack, so only the
+  // first history input in a task is a step the user asked for.
+  private historyInputPending = false;
 
   constructor(
     root: HTMLElement,
@@ -312,8 +326,11 @@ export class InputHost {
       this.blockStore.setRanges(blockRanges);
       this.selection = { start: plainText.length, end: plainText.length };
       this.selectionBackward = false;
+      // A new value is a new document, as native's `setText` makes it.
+      this.history.clear();
     });
     this.render();
+    this.emitHistoryState();
     return true;
   }
 
@@ -387,11 +404,30 @@ export class InputHost {
 
   toggleHeading(level: number): void {
     this.command(() => {
+      this.recordFormatting();
       this.session.scoped('processing', () =>
         this.blockCoordinator.toggleHeading(level, this.selection, this.text)
       );
       this.render();
       this.emitFormattingChanged();
+    });
+  }
+
+  undo(): void {
+    this.command(() => {
+      const step = this.history.undo(this.captureSnapshot);
+      if (step !== null) {
+        this.restore(step.edits, 'undo', step.target);
+      }
+    });
+  }
+
+  redo(): void {
+    this.command(() => {
+      const step = this.history.redo();
+      if (step !== null) {
+        this.restore(step.edits, 'redo', step.target);
+      }
     });
   }
 
@@ -459,6 +495,13 @@ export class InputHost {
       case 'insertReplacementText':
         this.replaceTargetRange(event, insertedTextOf(event));
         break;
+      // The model owns history, whoever wrote the DOM: the browser's own
+      // stack holds the native-edit fast path's keystrokes and nothing else,
+      // so replaying it would drift from the model.
+      case 'historyUndo':
+      case 'historyRedo':
+        this.historyInput(event.inputType);
+        break;
       case 'insertParagraph':
       case 'insertLineBreak':
         this.insertNewline();
@@ -469,14 +512,16 @@ export class InputHost {
         this.deleteBackwardTo(
           event,
           this.selection.start -
-            graphemeLengthBefore(this.text, this.selection.start)
+            graphemeLengthBefore(this.text, this.selection.start),
+          'deleting'
         );
         break;
       case 'deleteContentForward':
         this.deleteForwardTo(
           event,
           this.selection.end +
-            graphemeLengthAfter(this.text, this.selection.end)
+            graphemeLengthAfter(this.text, this.selection.end),
+          'deleting'
         );
         break;
       case 'deleteWordBackward':
@@ -515,16 +560,27 @@ export class InputHost {
       //   lists and split blocks. Lands with the formatting commands.
       // - `formatBold` and friends: the commands own these, including the
       //   keyboard shortcuts that raise them.
-      // - `historyUndo` / `historyRedo`: every model edit is a scripted
-      //   `nodeValue` write, so the browser's undo stack is empty and there is
-      //   nothing to diverge from - but there is no undo either until the
-      //   model keeps its own stack.
       // - `insertFromDrop`: needs a caret-from-point mapping to know where the
       //   drop landed. Denying it is inert rather than wrong.
       default:
         break;
     }
   };
+
+  private historyInput(inputType: 'historyUndo' | 'historyRedo'): void {
+    if (this.historyInputPending) {
+      return;
+    }
+    this.historyInputPending = true;
+    setTimeout(() => {
+      this.historyInputPending = false;
+    }, 0);
+    if (inputType === 'historyUndo') {
+      this.undo();
+    } else {
+      this.redo();
+    }
+  }
 
   // Applies the edit to the model and lets the browser write the DOM when
   // that matches what a render would (see `NativeEdit`). False when the edit
@@ -557,7 +613,7 @@ export class InputHost {
       return false;
     }
     this.syncSelectionFromDom();
-    this.applyModelEdit(editStart, deletedText, insertedText);
+    this.applyModelEdit(edit, insertedText.length > 0 ? 'typing' : 'deleting');
     const line = lineAtPosition(editStart, this.text);
     const runs = computeStyleRuns(
       this.formattingStore.allRanges,
@@ -641,19 +697,39 @@ export class InputHost {
     );
   }
 
-  // Tab never reaches beforeinput (the browser moves focus), so it is the
-  // one key handled here.
+  // Tab never reaches beforeinput (the browser moves focus). The history
+  // shortcuts do as `historyUndo`/`historyRedo`, but not cancelably in every
+  // engine, so they are taken here before the browser undoes anything itself.
   private readonly handleKeyDown = (event: KeyboardEvent): void => {
-    if (!this.editable || event.key !== 'Tab' || this.session.isComposing) {
+    if (!this.editable || event.isComposing || this.session.isComposing) {
+      return;
+    }
+    if (event.key === 'Tab') {
+      event.preventDefault();
+      this.settleNativeEdit();
+      this.syncSelectionFromDom();
+      if (event.shiftKey) {
+        this.outdentList();
+      } else {
+        this.indentList();
+      }
+      return;
+    }
+    const shortcut = historyShortcut(
+      event,
+      this.root.ownerDocument.defaultView?.navigator ?? null
+    );
+    if (shortcut === null) {
       return;
     }
     event.preventDefault();
-    this.settleNativeEdit();
-    this.syncSelectionFromDom();
-    if (event.shiftKey) {
-      this.outdentList();
+    if (this.pendingImports > 0) {
+      return;
+    }
+    if (shortcut === 'undo') {
+      this.undo();
     } else {
-      this.indentList();
+      this.redo();
     }
   };
 
@@ -663,6 +739,8 @@ export class InputHost {
       this.syncSelectionFromDom();
     }
     this.session.beginComposition();
+    // A composition is an undo step of its own.
+    this.history.breakGroup();
     // Rewrite the IME's lines when it ends, even if the text matches.
     this.renderer.markLinesDirty(
       this.mapper.lineIndexAt(this.selection.start),
@@ -678,7 +756,8 @@ export class InputHost {
 
   private endComposition(): void {
     this.session.endComposition();
-    this.recoverComposition();
+    this.recoverComposition('composition');
+    this.history.breakGroup();
     this.runDeferredCommands();
   }
 
@@ -701,7 +780,7 @@ export class InputHost {
     }
     if (composing) {
       if (this.editable && this.pendingImports === 0) {
-        this.readBackFromDom({ render: false });
+        this.readBackFromDom({ render: false, kind: 'composition' });
       }
       return;
     }
@@ -715,7 +794,7 @@ export class InputHost {
       this.render();
       return;
     }
-    this.recoverComposition();
+    this.recoverComposition('other');
   };
 
   private readonly handlePointerDown = (event: PointerEvent): void => {
@@ -756,9 +835,9 @@ export class InputHost {
   // while the IME held the DOM - must not be read back as an edit, but the
   // nodes the IME left behind still have to go, so the model is rendered over
   // them instead.
-  private recoverComposition(): void {
+  private recoverComposition(kind: EditKind): void {
     if (this.editable) {
-      this.readBackFromDom();
+      this.readBackFromDom({ kind });
       return;
     }
     this.renderer.invalidate();
@@ -783,7 +862,11 @@ export class InputHost {
       return;
     }
     event.clipboardData?.setData('text/plain', this.text.slice(start, end));
-    this.applyEdit(start, this.text.slice(start, end), '');
+    this.applyEdit({
+      editStart: start,
+      deletedText: this.text.slice(start, end),
+      insertedText: '',
+    });
   };
 
   private readonly handlePaste = (event: ClipboardEvent): void => {
@@ -871,6 +954,8 @@ export class InputHost {
   // above, so no grace window is needed (iOS keeps 100 ms).
   private resetTypingAfterSelectionMove(): void {
     this.typing.resetForSelectionChange(this.selection);
+    // Typing somewhere else is a new undo step.
+    this.history.breakGroup();
   }
 
   // The browser owns the DOM through a composition, so the composed text
@@ -887,7 +972,13 @@ export class InputHost {
   //
   // The diff is anchored on the DOM caret (see `diffEdit`). `render: false`
   // is the mid-composition update, while the DOM still belongs to the IME.
-  private readBackFromDom({ render = true }: { render?: boolean } = {}): void {
+  private readBackFromDom({
+    render = true,
+    kind,
+  }: {
+    render?: boolean;
+    kind: EditKind;
+  }): void {
     if (this.destroyed) {
       return;
     }
@@ -905,14 +996,10 @@ export class InputHost {
       }
       return;
     }
-    const { editStart, deletedText, insertedText } = diffEdit(
-      this.text,
-      domText,
-      caret
-    );
-    this.applyEdit(editStart, deletedText, insertedText, {
+    this.applyEdit(diffEdit(this.text, domText, caret), {
       caret: caret === null ? undefined : caret,
       render,
+      kind,
     });
   }
 
@@ -949,10 +1036,13 @@ export class InputHost {
   }
 
   private changeListDepthBy(delta: number): void {
+    this.recordFormatting();
     const changed = this.session.scoped('processing', () =>
       this.blockCoordinator.changeListDepthBy(delta, this.selection, this.text)
     );
-    if (changed) {
+    if (!changed) {
+      this.history.discardFormatting();
+    } else {
       this.render();
       this.emitFormattingChanged();
     }
@@ -960,6 +1050,7 @@ export class InputHost {
 
   private toggleListType(type: BlockType): void {
     // Also reached from Enter and Backspace, which never run mid-composition.
+    this.recordFormatting();
     this.session.scoped('processing', () =>
       this.blockCoordinator.toggleListType(type, this.selection, this.text)
     );
@@ -970,6 +1061,13 @@ export class InputHost {
   private toggleInlineStyle(type: PendingStyleType): void {
     this.command(() => {
       const { start, end } = this.selection;
+      // A caret toggle changes no store, so there is nothing to undo; what
+      // is typed with it is a step of its own, though.
+      if (start !== end) {
+        this.recordFormatting();
+      } else {
+        this.history.breakGroup();
+      }
       const wasActive = this.session.scoped('processing', () =>
         this.formattingStore.toggleStyle(type, start, end)
       );
@@ -991,7 +1089,11 @@ export class InputHost {
 
   private replaceSelection(insertedText: string): void {
     const { start, end } = this.selection;
-    this.applyEdit(start, this.text.slice(start, end), insertedText);
+    this.applyEdit({
+      editStart: start,
+      deletedText: this.text.slice(start, end),
+      insertedText,
+    });
   }
 
   // The event's target range, or the selection when it has none.
@@ -1000,10 +1102,15 @@ export class InputHost {
     if (insertedText.length === 0 && target.start === target.end) {
       return;
     }
+    const deletedText = this.text.slice(target.start, target.end);
     this.applyEdit(
-      target.start,
-      this.text.slice(target.start, target.end),
-      insertedText
+      { editStart: target.start, deletedText, insertedText },
+      {
+        kind:
+          deletedText.length === 0 && !insertedText.includes('\n')
+            ? 'typing'
+            : 'other',
+      }
     );
   }
 
@@ -1034,7 +1141,13 @@ export class InputHost {
 
   // Deletes back to the event's target range, else to `fallback`. A fallback
   // that makes no progress (caret at a line start) deletes the newline.
-  private deleteBackwardTo(event: InputEvent, fallback: number): void {
+  // `kind` is `deleting` for a single character, so a run of them is one
+  // undo step.
+  private deleteBackwardTo(
+    event: InputEvent,
+    fallback: number,
+    kind: EditKind = 'other'
+  ): void {
     const { start, end } = this.selection;
     if (start !== end) {
       this.replaceSelection('');
@@ -1048,17 +1161,21 @@ export class InputHost {
     }
     const target = this.modelRangeFromTargetRanges(event);
     if (target !== null && target.start < target.end) {
-      this.deleteRange(target);
+      this.deleteRange(target, kind);
       return;
     }
     const from =
       fallback < start
         ? fallback
         : start - graphemeLengthBefore(this.text, start);
-    this.applyEdit(from, this.text.slice(from, start), '');
+    this.deleteRange({ start: from, end: start }, kind);
   }
 
-  private deleteForwardTo(event: InputEvent, fallback: number): void {
+  private deleteForwardTo(
+    event: InputEvent,
+    fallback: number,
+    kind: EditKind = 'other'
+  ): void {
     const { start, end } = this.selection;
     if (start !== end) {
       this.replaceSelection('');
@@ -1069,16 +1186,26 @@ export class InputHost {
     }
     const target = this.modelRangeFromTargetRanges(event);
     if (target !== null && target.start < target.end) {
-      this.deleteRange(target);
+      this.deleteRange(target, kind);
       return;
     }
     const to =
       fallback > end ? fallback : end + graphemeLengthAfter(this.text, end);
-    this.applyEdit(end, this.text.slice(end, to), '');
+    this.deleteRange({ start: end, end: to }, kind);
   }
 
-  private deleteRange({ start, end }: RangeBounds): void {
-    this.applyEdit(start, this.text.slice(start, end), '');
+  private deleteRange(
+    { start, end }: RangeBounds,
+    kind: EditKind = 'other'
+  ): void {
+    this.applyEdit(
+      {
+        editStart: start,
+        deletedText: this.text.slice(start, end),
+        insertedText: '',
+      },
+      { kind }
+    );
   }
 
   // Backspace into a link deletes all of it, as on both natives.
@@ -1087,21 +1214,23 @@ export class InputHost {
     if (link === null) {
       return false;
     }
-    this.applyEdit(link.start, this.text.slice(link.start, link.end), '');
+    this.deleteRange(link);
     return true;
   }
 
   // The native keystroke choreography: model phase, render phase, then
   // events, in the iOS order.
   // `caret` overrides where the caret lands; `render: false` leaves the DOM
-  // to the IME.
+  // to the IME. `kind` decides whether the edit joins the open undo step.
   private applyEdit(
-    editStart: number,
-    deletedText: string,
-    insertedText: string,
-    { caret, render = true }: { caret?: number; render?: boolean } = {}
+    edit: TextEdit,
+    {
+      caret,
+      render = true,
+      kind = 'other',
+    }: { caret?: number; render?: boolean; kind?: EditKind } = {}
   ): void {
-    this.applyModelEdit(editStart, deletedText, insertedText, caret);
+    this.applyModelEdit(edit, kind, caret);
     if (render) {
       this.renderEdit();
     } else {
@@ -1115,18 +1244,21 @@ export class InputHost {
     this.emitTextEdited();
   }
 
-  // Text, stores and caret only; no DOM, no events.
-  private applyModelEdit(
-    editStart: number,
-    deletedText: string,
-    insertedText: string,
-    caret?: number
-  ): void {
+  // Text, stores and caret only; no DOM, no events. The one place text
+  // changes, and so the one place it is recorded.
+  private applyModelEdit(edit: TextEdit, kind: EditKind, caret?: number): void {
+    const { editStart, deletedText, insertedText } = edit;
+    const text =
+      this.text.slice(0, editStart) +
+      insertedText +
+      this.text.slice(editStart + deletedText.length);
+    const landing = codePointBoundaryAtOrBefore(
+      text,
+      clamp(caret ?? editStart + insertedText.length, 0, text.length)
+    );
+    this.history.record(edit, kind, this.captureSnapshot, landing);
     this.session.scoped('processing', () => {
-      this.text =
-        this.text.slice(0, editStart) +
-        insertedText +
-        this.text.slice(editStart + deletedText.length);
+      this.text = text;
       this.pipeline.processTextChange(this.text, {
         editStart,
         deletedText,
@@ -1134,12 +1266,61 @@ export class InputHost {
         pendingStyles: this.typing.styles,
         pendingStyleRemovals: this.typing.styleRemovals,
       });
-      const landing = this.snapToModel(
-        caret ?? editStart + insertedText.length
-      );
       this.selection = { start: landing, end: landing };
       this.selectionBackward = false;
     });
+  }
+
+  // The history packs what it keeps, so the live ranges are handed over as
+  // they are.
+  private readonly captureSnapshot = (): ModelSnapshot => ({
+    formatting: this.formattingStore.allRanges,
+    blocks: this.blockStore.allRanges,
+    selection: { ...this.selection },
+    backward: this.selectionBackward,
+  });
+
+  // Rewinds or replays one history entry: the text by splicing its edits
+  // (no pipeline - the ranges come from the snapshot, not from adjusting),
+  // then the ranges and selection `target` holds.
+  private restore(
+    edits: readonly TextEdit[],
+    direction: 'undo' | 'redo',
+    target: ModelSnapshot
+  ): void {
+    this.session.scoped('processing', () => {
+      let text = this.text;
+      if (direction === 'undo') {
+        for (let i = edits.length - 1; i >= 0; i--) {
+          const { editStart, deletedText, insertedText } = edits[i]!;
+          text =
+            text.slice(0, editStart) +
+            deletedText +
+            text.slice(editStart + insertedText.length);
+        }
+      } else {
+        for (const { editStart, deletedText, insertedText } of edits) {
+          text =
+            text.slice(0, editStart) +
+            insertedText +
+            text.slice(editStart + deletedText.length);
+        }
+      }
+      this.text = text;
+      // Fresh objects from the history: the stores may mutate them.
+      this.formattingStore.setRanges([...target.formatting]);
+      this.blockStore.setRanges([...target.blocks]);
+      this.selection = { ...target.selection };
+      this.selectionBackward = target.backward;
+    });
+    this.typing.resetForSelectionChange(this.selection);
+    this.render();
+    this.scrollCaretIntoView();
+    this.emitTextEdited();
+  }
+
+  private recordFormatting(): void {
+    this.history.recordFormatting(this.captureSnapshot);
   }
 
   // A scripted caret write does not scroll. Only after edits: a selection
@@ -1268,16 +1449,34 @@ export class InputHost {
     this.callbacks.onChangeMarkdown(this.getMarkdown());
   }
 
+  // Only when the answer flips, so typing emits nothing past its first key.
+  private emitHistoryState(): void {
+    if (this.session.shouldSuppressEvents) {
+      return;
+    }
+    const state = this.history.state;
+    if (
+      state.canUndo === this.lastEmittedHistory.canUndo &&
+      state.canRedo === this.lastEmittedHistory.canRedo
+    ) {
+      return;
+    }
+    this.lastEmittedHistory = state;
+    this.callbacks.onChangeHistoryState?.(state);
+  }
+
   private emitTextEdited(): void {
     this.emitText();
     this.emitSelection();
     this.emitState();
     this.emitMarkdown();
+    this.emitHistoryState();
   }
 
   private emitFormattingChanged(): void {
     this.emitState();
     this.emitMarkdown();
+    this.emitHistoryState();
   }
 
   private emitSelectionMoved(): void {
@@ -1430,6 +1629,41 @@ function setAttributeIfAbsent(
   if (!element.hasAttribute(name)) {
     element.setAttribute(name, value);
   }
+}
+
+// Mod+Z undoes, Mod+Shift+Z redoes; Mod is Cmd on Apple platforms and Ctrl
+// elsewhere, where Ctrl+Y redoes too.
+function historyShortcut(
+  event: KeyboardEvent,
+  navigator: Navigator | null
+): 'undo' | 'redo' | null {
+  if (event.altKey) {
+    return null;
+  }
+  const apple = isApplePlatform(navigator);
+  const mod = apple
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
+  if (!mod) {
+    return null;
+  }
+  const key = event.key.toLowerCase();
+  if (key === 'z') {
+    return event.shiftKey ? 'redo' : 'undo';
+  }
+  if (key === 'y' && !apple && !event.shiftKey) {
+    return 'redo';
+  }
+  return null;
+}
+
+function isApplePlatform(navigator: Navigator | null): boolean {
+  const platform =
+    (navigator as { userAgentData?: { platform?: string } } | null)
+      ?.userAgentData?.platform ??
+    navigator?.platform ??
+    '';
+  return /mac|iphone|ipad|ipod/i.test(platform);
 }
 
 // `insertText` and `insertReplacementText` carry their text on `data` in some

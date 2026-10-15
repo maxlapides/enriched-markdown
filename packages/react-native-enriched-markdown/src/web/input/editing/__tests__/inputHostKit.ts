@@ -2,6 +2,7 @@
 // the events a browser would raise by itself - `beforeinput`,
 // `selectionchange`, the clipboard pair - so each one is built here by hand,
 // in the shape the host reads it.
+import type { HistoryState } from '../EditHistory';
 import { InputHost, type InputHostOptions } from '../InputHost';
 import type { InputState } from '../InputState';
 import type { RangeBounds } from '../../model/rangeBounds';
@@ -13,6 +14,7 @@ export interface MountedHost {
   states: InputState[];
   selections: RangeBounds[];
   markdowns: string[];
+  histories: HistoryState[];
 }
 
 export function mount(options?: InputHostOptions): MountedHost {
@@ -22,6 +24,7 @@ export function mount(options?: InputHostOptions): MountedHost {
   const states: InputState[] = [];
   const selections: RangeBounds[] = [];
   const markdowns: string[] = [];
+  const histories: HistoryState[] = [];
   const host = new InputHost(
     root,
     {
@@ -29,10 +32,11 @@ export function mount(options?: InputHostOptions): MountedHost {
       onChangeState: (state) => states.push(state),
       onChangeSelection: (selection) => selections.push({ ...selection }),
       onChangeMarkdown: (markdown) => markdowns.push(markdown),
+      onChangeHistoryState: (state) => histories.push(state),
     },
     options
   );
-  return { root, host, texts, states, selections, markdowns };
+  return { root, host, texts, states, selections, markdowns, histories };
 }
 
 export function lastState(states: InputState[]): InputState {
@@ -47,6 +51,24 @@ export function pressTab(root: HTMLElement, shiftKey = false): KeyboardEvent {
   const event = new KeyboardEvent('keydown', {
     key: 'Tab',
     shiftKey,
+    bubbles: true,
+    cancelable: true,
+  });
+  root.dispatchEvent(event);
+  return event;
+}
+
+export function pressKey(
+  root: HTMLElement,
+  key: string,
+  modifiers: Pick<
+    KeyboardEventInit,
+    'ctrlKey' | 'metaKey' | 'shiftKey' | 'altKey'
+  > = {}
+): KeyboardEvent {
+  const event = new KeyboardEvent('keydown', {
+    key,
+    ...modifiers,
     bubbles: true,
     cancelable: true,
   });

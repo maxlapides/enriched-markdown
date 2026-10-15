@@ -11,6 +11,7 @@ import { toHeadingLevel } from './headingLevel';
 import type {
   CaretRect,
   HeadingLevel,
+  HistoryState,
   MarkdownTextInputInstance,
   MeasureCallback,
   MeasureInWindowCallback,
@@ -30,6 +31,7 @@ import {
 export type {
   CaretRect,
   HeadingLevel,
+  HistoryState,
   MeasureCallback,
   MeasureInWindowCallback,
   MeasureLayoutCallback,
@@ -68,6 +70,7 @@ export interface EnrichedMarkdownTextInputProps extends ForwardedDomProps {
   onChangeSelection?: (selection: { start: number; end: number }) => void;
   onChangeState?: (state: StyleState) => void;
   onChangeMarkdown?: (markdown: string) => void;
+  onChangeHistoryState?: (state: HistoryState) => void;
   onFocus?: () => void;
   onBlur?: () => void;
 }
@@ -121,6 +124,7 @@ export const EnrichedMarkdownTextInput = forwardRef<
     onChangeSelection,
     onChangeState,
     onChangeMarkdown,
+    onChangeHistoryState,
     onFocus,
     onBlur,
     ...domProps
@@ -138,6 +142,7 @@ export const EnrichedMarkdownTextInput = forwardRef<
     onChangeSelection,
     onChangeState,
     onChangeMarkdown,
+    onChangeHistoryState,
     onFocus,
     onBlur,
   };
@@ -165,6 +170,8 @@ export const EnrichedMarkdownTextInput = forwardRef<
           callbacks.current.onChangeState?.(toStyleState(state)),
         onChangeMarkdown: (markdown) =>
           callbacks.current.onChangeMarkdown?.(markdown),
+        onChangeHistoryState: (state) =>
+          callbacks.current.onChangeHistoryState?.(state),
       },
       { spellCheck: initialSpellCheck }
     );
@@ -245,6 +252,8 @@ export const EnrichedMarkdownTextInput = forwardRef<
       toggleOrderedList: () => run(() => host.current?.toggleOrderedList()),
       indentList: () => run(() => host.current?.indentList()),
       outdentList: () => run(() => host.current?.outdentList()),
+      undo: () => run(() => host.current?.undo()),
+      redo: () => run(() => host.current?.redo()),
 
       setLink: notImplemented('setLink'),
       insertLink: notImplemented('insertLink'),

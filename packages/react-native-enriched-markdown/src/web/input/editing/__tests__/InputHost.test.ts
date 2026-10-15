@@ -36,7 +36,7 @@ describe('InputHost', () => {
     const { root, host } = mount();
     typeText(root, 'ab');
 
-    for (const inputType of ['formatBold', 'historyUndo', 'insertFromDrop']) {
+    for (const inputType of ['formatBold', 'insertFromDrop']) {
       const event = new InputEvent('beforeinput', {
         inputType,
         bubbles: true,
@@ -46,6 +46,28 @@ describe('InputHost', () => {
       expect(event.defaultPrevented).toBe(true);
     }
     expect(host.value).toBe('ab');
+  });
+
+  // The browser's own stack holds only the fast path's keystrokes, so it is
+  // never let run: the model replays its own instead.
+  it('cancels the history input types and replays the model history', () => {
+    jest.useFakeTimers();
+    const { root, host } = mount();
+    typeText(root, 'ab');
+
+    for (const inputType of ['historyUndo', 'historyRedo']) {
+      const event = new InputEvent('beforeinput', {
+        inputType,
+        bubbles: true,
+        cancelable: true,
+      });
+      root.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+      expect(host.value).toBe(inputType === 'historyUndo' ? '' : 'ab');
+      // One history input per task (see `historyInput`).
+      jest.runAllTimers();
+    }
+    jest.useRealTimers();
   });
 
   describe('deleting', () => {

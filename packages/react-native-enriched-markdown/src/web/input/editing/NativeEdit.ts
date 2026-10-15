@@ -1,5 +1,6 @@
 import { classNameFor, isReusableRun } from '../render/DomRenderer';
 import type { StyleRun } from '../render/InputProjection';
+import type { TextEdit } from '../model/textEdit';
 import { isCaret } from './SelectionMapper';
 
 // An edit the browser performs itself, inside one run's text node.
@@ -13,10 +14,7 @@ import { isCaret } from './SelectionMapper';
 // `nodeText` predicts the text node after the edit; it is checked against
 // the model's runs before the event is let through, and against the DOM on
 // `input`.
-export interface NativeEdit {
-  editStart: number;
-  deletedText: string;
-  insertedText: string;
+export interface NativeEdit extends TextEdit {
   line: Element;
   span: Element;
   node: Text;

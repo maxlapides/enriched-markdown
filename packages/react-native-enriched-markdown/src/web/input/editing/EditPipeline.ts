@@ -5,11 +5,9 @@ import {
   createFormattingRange,
   type PendingStyleType,
 } from '../model/inlineStyles';
+import type { TextEdit } from '../model/textEdit';
 
-export interface EditContext {
-  editStart: number;
-  deletedText: string;
-  insertedText: string;
+export interface EditContext extends TextEdit {
   pendingStyles: readonly PendingStyleType[];
   pendingStyleRemovals: readonly PendingStyleType[];
 }
