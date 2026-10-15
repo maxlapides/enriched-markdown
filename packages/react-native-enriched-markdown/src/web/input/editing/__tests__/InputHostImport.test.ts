@@ -40,10 +40,12 @@ function mount() {
   const root = document.createElement('div');
   document.body.appendChild(root);
   const texts: string[] = [];
+  const markdowns: string[] = [];
   const host = new InputHost(root, {
     onChangeText: (text) => texts.push(text),
+    onChangeMarkdown: (markdown) => markdowns.push(markdown),
   });
-  return { root, host, texts };
+  return { root, host, texts, markdowns };
 }
 
 function typeText(root: HTMLElement, data: string): void {
@@ -87,6 +89,22 @@ describe('InputHost imports', () => {
 
     expect(host.value).toBe('loaded');
     expect(texts).toEqual(['loaded']);
+  });
+
+  it('setValue does not re-emit markdown the listener already has', async () => {
+    const { host, markdowns } = mount();
+    let finish = deferParse('loaded');
+    let setting = host.setValue('loaded');
+    await finish();
+    await setting;
+    expect(markdowns).toEqual(['loaded']);
+
+    finish = deferParse('loaded');
+    setting = host.setValue('loaded');
+    await finish();
+    await setting;
+
+    expect(markdowns).toEqual(['loaded']);
   });
 
   it('renders the imported value and parks the caret at its end', async () => {

@@ -74,10 +74,11 @@ export class BlockEditCoordinator {
     return isListItem(block) ? block.level : null;
   }
 
-  toggleHeading(level: number, selection: RangeBounds, text: string): void {
+  // Returns false when `level` names no heading and nothing was touched.
+  toggleHeading(level: number, selection: RangeBounds, text: string): boolean {
     const type = blockTypeForHeadingLevel(level);
     if (type === null) {
-      return;
+      return false;
     }
     const startBlock = this.blockStore.blockAt(selection.start, text);
     const turningOff =
@@ -95,6 +96,7 @@ export class BlockEditCoordinator {
       }
     });
     this.blockStore.normalizeToLineBounds(text);
+    return true;
   }
 
   // Turns the list off when the item at the selection start already has

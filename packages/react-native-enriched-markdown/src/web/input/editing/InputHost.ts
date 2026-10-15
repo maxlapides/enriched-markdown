@@ -99,6 +99,7 @@ export class InputHost {
   private pendingImports = 0;
   private editable = true;
   private markdownEmitEnabled = true;
+  private lastEmittedMarkdown: string | null = null;
   private lastEmittedState: InputState | null = null;
   private lastEmittedHistory: HistoryState = { canUndo: false, canRedo: false };
   // WebKit raises one `historyUndo` per entry on its own stack for a single
@@ -241,6 +242,9 @@ export class InputHost {
   // inspecting the callback.
   setMarkdownEmitEnabled(enabled: boolean): void {
     this.markdownEmitEnabled = enabled;
+    // Whatever was emitted before the gap says nothing about what the
+    // listener last saw.
+    this.lastEmittedMarkdown = null;
   }
 
   // In the root's content coordinates (padding box plus scroll offset), as
@@ -405,9 +409,13 @@ export class InputHost {
   toggleHeading(level: number): void {
     this.command(() => {
       this.recordFormatting();
-      this.session.scoped('processing', () =>
+      const changed = this.session.scoped('processing', () =>
         this.blockCoordinator.toggleHeading(level, this.selection, this.text)
       );
+      if (!changed) {
+        this.history.discardFormatting();
+        return;
+      }
       this.render();
       this.emitFormattingChanged();
     });
@@ -1083,7 +1091,11 @@ export class InputHost {
     });
   }
 
+  // Empty text is a no-op even over a selection, as on the natives.
   insertText(text: string): void {
+    if (text.length === 0) {
+      return;
+    }
     this.command(() => this.replaceSelection(text));
   }
 
@@ -1446,7 +1458,12 @@ export class InputHost {
     ) {
       return;
     }
-    this.callbacks.onChangeMarkdown(this.getMarkdown());
+    const markdown = this.getMarkdown();
+    if (markdown === this.lastEmittedMarkdown) {
+      return;
+    }
+    this.lastEmittedMarkdown = markdown;
+    this.callbacks.onChangeMarkdown(markdown);
   }
 
   // Only when the answer flips, so typing emits nothing past its first key.

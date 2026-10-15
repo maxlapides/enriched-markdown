@@ -276,6 +276,83 @@ describe('a read-only editor', () => {
   });
 });
 
+// A command that changes nothing must not look like an edit to the app: no
+// events, no render, and no undo entry to step through.
+describe('a command that changes nothing', () => {
+  it('insertText with empty text emits nothing at a caret', () => {
+    const { host, root, texts, selections, markdowns } = mount();
+    typeText(root, 'hi');
+    const counts = [texts.length, selections.length, markdowns.length];
+
+    host.insertText('');
+
+    expect([texts.length, selections.length, markdowns.length]).toEqual(counts);
+  });
+
+  // The natives ignore it outright rather than deleting the selection.
+  it('insertText with empty text leaves a selection in place', () => {
+    const { host, root, texts } = mount();
+    typeText(root, 'hello');
+    host.setSelection(1, 4);
+    const emitted = texts.length;
+
+    host.insertText('');
+
+    expect(host.value).toBe('hello');
+    expect(texts).toHaveLength(emitted);
+  });
+
+  it('toggleHeading with a level that names no heading emits nothing', () => {
+    const { host, root, states, markdowns, histories } = mount();
+    typeText(root, 'hi');
+    const html = root.innerHTML;
+    const counts = [states.length, markdowns.length, histories.length];
+
+    host.toggleHeading(9);
+
+    expect(root.innerHTML).toBe(html);
+    expect([states.length, markdowns.length, histories.length]).toEqual(counts);
+  });
+
+  it('toggleHeading with a bad level leaves no undo entry behind', () => {
+    const { host, root } = mount();
+    typeText(root, 'hi');
+
+    host.toggleHeading(9);
+    host.undo();
+
+    expect(host.value).toBe('');
+  });
+});
+
+describe('markdown emits', () => {
+  // Bold at a caret only arms a typing attribute; the document is untouched.
+  it('skip a change that leaves the markdown as it was', () => {
+    const { host, root, markdowns, states } = mount();
+    typeText(root, 'hi');
+    const emitted = markdowns.length;
+    const stateCount = states.length;
+
+    host.toggleBold();
+
+    expect(states.length).toBeGreaterThan(stateCount);
+    expect(markdowns).toHaveLength(emitted);
+  });
+
+  it('report again after the emit switch is turned back on', () => {
+    const { host, root, markdowns } = mount();
+    typeText(root, 'hi');
+    host.setMarkdownEmitEnabled(false);
+    host.setMarkdownEmitEnabled(true);
+    const emitted = markdowns.length;
+
+    host.toggleHeading(9);
+    typeText(root, '!');
+
+    expect(markdowns.slice(emitted)).toEqual(['hi!']);
+  });
+});
+
 describe('setMarkdownEmitEnabled', () => {
   // Serializing the whole document after every edit is only worth doing when
   // something is listening, and the callback alone cannot answer that: a
