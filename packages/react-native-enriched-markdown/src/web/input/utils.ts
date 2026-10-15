@@ -87,11 +87,6 @@ const graphemeSegmenter: GraphemeSegmenter | null = (() => {
   }
 })();
 
-// A cluster has no length limit in principle (a ZWJ chain can run as long as
-// it likes), so segmentation runs over a window and widens only when the
-// window turns out to be one unbroken cluster.
-const GRAPHEME_WINDOW = 64;
-
 // Length in UTF-16 units of the grapheme cluster before/after `position`, or
 // 0 at the respective end of the buffer.
 //
@@ -103,53 +98,53 @@ const GRAPHEME_WINDOW = 64;
 // `-[UITextView deleteBackward]`, Android to `deleteSurroundingText`, whose
 // backspace uses `TextUtils.getOffsetBefore`); web has to compute the step
 // itself, so it segments instead.
+//
+// Segmentation runs from the start of the line. A cluster never crosses a
+// newline, so that is the nearest point known to be a boundary; any later
+// starting point can be one, and a run of flags read from its middle pairs
+// the regional indicators the wrong way round.
 export function graphemeLengthBefore(text: string, position: number): number {
   if (position <= 0) {
     return 0;
   }
+  if (text[position - 1] === '\n') {
+    return 1;
+  }
   if (graphemeSegmenter === null) {
     return codePointLengthBefore(text, position);
   }
-  for (let window = GRAPHEME_WINDOW; ; window *= 2) {
-    const from = Math.max(position - window, 0);
-    let lastBoundary = 0;
-    for (const { index } of graphemeSegmenter.segment(
-      text.slice(from, position)
-    )) {
-      lastBoundary = index;
-    }
-    // A window that holds no boundary past its own start is one cluster, so
-    // the real boundary may lie further back; widen unless the whole prefix
-    // is already in view.
-    if (lastBoundary > 0 || from === 0) {
-      return position - (from + lastBoundary);
-    }
+  const lineStart = text.lastIndexOf('\n', position - 1) + 1;
+  let lastBoundary = 0;
+  for (const { index } of graphemeSegmenter.segment(
+    text.slice(lineStart, position)
+  )) {
+    lastBoundary = index;
   }
+  return position - (lineStart + lastBoundary);
 }
 
+// `position` is a caret, and so already a boundary; the next one is where
+// the first segment from it ends.
 export function graphemeLengthAfter(text: string, position: number): number {
   if (position >= text.length) {
     return 0;
   }
+  if (text[position] === '\n') {
+    return 1;
+  }
   if (graphemeSegmenter === null) {
     return codePointLengthAfter(text, position);
   }
-  for (let window = GRAPHEME_WINDOW; ; window *= 2) {
-    const to = Math.min(position + window, text.length);
-    const slice = text.slice(position, to);
-    let nextBoundary = slice.length;
-    let seenFirst = false;
-    for (const { index } of graphemeSegmenter.segment(slice)) {
-      if (seenFirst) {
-        nextBoundary = index;
-        break;
-      }
-      seenFirst = true;
+  const lineEnd = text.indexOf('\n', position);
+  const slice = text.slice(position, lineEnd === -1 ? text.length : lineEnd);
+  let seenFirst = false;
+  for (const { index } of graphemeSegmenter.segment(slice)) {
+    if (seenFirst) {
+      return index;
     }
-    if (nextBoundary < slice.length || to === text.length) {
-      return nextBoundary;
-    }
+    seenFirst = true;
   }
+  return slice.length;
 }
 
 function codePointLengthBefore(text: string, position: number): number {

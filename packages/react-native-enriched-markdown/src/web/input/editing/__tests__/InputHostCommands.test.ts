@@ -145,17 +145,53 @@ describe('caretRect', () => {
     const { host, root } = mount();
     typeText(root, 'hello');
     stubElementBox(root, { left: 124, top: 158, width: 300, height: 40 });
-    stubRangeBox({ left: 160, top: 170, width: 2, height: 18 });
+    stubRangeBox({ left: 160, top: 170, width: 0, height: 18 });
 
+    // Two physical pixels wide, as Android reports it.
     expect(host.caretRect()).toEqual({ x: 36, y: 12, width: 2, height: 18 });
   });
 
+  // Native reports the caret in the editor's content, so a scrolled editor
+  // adds its scroll offset rather than reporting where it sits on screen.
+  it('adds the scroll offset and leaves out the border', () => {
+    const { host, root } = mount();
+    typeText(root, 'hello');
+    stubElementBox(root, { left: 100, top: 100, width: 300, height: 40 });
+    Object.defineProperty(root, 'clientTop', { value: 1 });
+    Object.defineProperty(root, 'clientLeft', { value: 1 });
+    root.scrollTop = 0;
+    Object.defineProperty(root, 'scrollTop', { value: 50 });
+    stubRangeBox({ left: 111, top: 121, width: 0, height: 18 });
+
+    expect(host.caretRect()).toEqual({ x: 10, y: 70, width: 2, height: 18 });
+  });
+
   // An empty line renders as a lone <br>, so its caret resolves to the
-  // paragraph element, and a range collapsed at an element boundary has no
+  // line element, and a range collapsed at an element boundary has no
   // client rects in Blink or WebKit: `getBoundingClientRect` answers an
-  // all-zero box there. Subtracting the editor's own position from that box
-  // would report the editor's position negated.
-  it('falls back to the line box on an empty line', () => {
+  // all-zero box there. The <br> stands in: it sits after a list indent and
+  // is as tall as the text rather than the line box.
+  it('measures the line break on an empty line', () => {
+    const { host, root } = mount();
+    stubElementBox(root, { left: 124, top: 158, width: 300, height: 40 });
+    stubElementBox(root.firstElementChild!, {
+      left: 136,
+      top: 166,
+      width: 280,
+      height: 26,
+    });
+    stubElementBox(root.querySelector('br')!, {
+      left: 154,
+      top: 168,
+      width: 0,
+      height: 22,
+    });
+    stubRangeBox(ZERO_BOX);
+
+    expect(host.caretRect()).toEqual({ x: 30, y: 10, width: 2, height: 22 });
+  });
+
+  it('falls back to the line box when the line break has none', () => {
     const { host, root } = mount();
     stubElementBox(root, { left: 124, top: 158, width: 300, height: 40 });
     stubElementBox(root.firstElementChild!, {
@@ -166,7 +202,7 @@ describe('caretRect', () => {
     });
     stubRangeBox(ZERO_BOX);
 
-    expect(host.caretRect()).toEqual({ x: 12, y: 8, width: 0, height: 20 });
+    expect(host.caretRect()).toEqual({ x: 12, y: 8, width: 2, height: 20 });
   });
 
   it('keeps the zero box when the line has no box either', () => {

@@ -1,5 +1,4 @@
 import { LIST_ITEM_BLOCK_TYPES } from '../model/blocks';
-import type { RangeBounds } from '../model/rangeBounds';
 import {
   sameRunStyle,
   type ParagraphProjection,
@@ -12,10 +11,12 @@ const LOG_PREFIX = '[EnrichedMarkdown - DomRenderer]';
 // in these nodes, so existing nodes are mutated rather than replaced; nodes
 // are added or removed only when the paragraph/run structure changes.
 //
-// Element children of the root correspond to the projection index for index,
-// which is the invariant the selection mapper reads positions through. Only
-// `render` maintains it, so only `render` traverses `children` - a foreign
-// node the browser or an extension leaves behind is not a line.
+// The renderer owns its line elements: `lines` holds them in projection
+// order, and every patch addresses a line by reference rather than by its
+// position among the root's children. The browser can merge, split or drop
+// lines under an IME, and an extension can insert nodes of its own; indexing
+// `root.children` would then patch or remove the wrong line. A root whose
+// children no longer match `lines` is rebuilt instead of patched.
 export class DomRenderer {
   private readonly root: HTMLElement;
   private renderedText = '';
@@ -25,6 +26,13 @@ export class DomRenderer {
   // per line and `computeStyleRuns` fresh runs, reading stored ranges only for
   // their numbers), so no later store mutation can reach it.
   private renderedParagraphs: readonly ParagraphProjection[] = [];
+  private lines: HTMLElement[] = [];
+  // Line element -> index into `lines`, so the mapper resolves a DOM point's
+  // line in O(1) instead of counting siblings.
+  private lineIndices = new WeakMap<Node, number>();
+  // Lines something other than this renderer wrote into (an IME), patched on
+  // the next render whether or not the model changed there.
+  private readonly dirtyLines = new Set<HTMLElement>();
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -32,19 +40,48 @@ export class DomRenderer {
     this.root.replaceChildren();
   }
 
+  // Whether some line awaits a rewrite the model alone would not trigger.
+  get hasDirtyLines(): boolean {
+    return this.dirtyLines.size > 0;
+  }
+
   get lineCount(): number {
     return this.renderedParagraphs.length;
   }
 
-  // Line offsets for the selection mapper, as fresh bounds per call. Handing
-  // out the stored paragraph would expose the diff baseline: a caller
-  // mutating `start`/`end` makes a changed line compare equal, and `render`
-  // then skips patching it.
-  lineBounds(index: number): RangeBounds | undefined {
-    const paragraph = this.renderedParagraphs[index];
-    return paragraph === undefined
-      ? undefined
-      : { start: paragraph.start, end: paragraph.end };
+  // Line offsets for the selection mapper, read straight off the baseline so
+  // a binary search over them allocates nothing.
+  lineStart(index: number): number {
+    return this.renderedParagraphs[index]?.start ?? 0;
+  }
+
+  lineEnd(index: number): number {
+    return this.renderedParagraphs[index]?.end ?? 0;
+  }
+
+  lineElement(index: number): HTMLElement | undefined {
+    return this.lines[index];
+  }
+
+  // The index of `node` among the rendered lines, or -1 when it is not one -
+  // including a line element that has since left the root.
+  indexOfLine(node: Node): number {
+    const index = this.lineIndices.get(node);
+    return index !== undefined &&
+      this.lines[index] === node &&
+      node.parentNode === this.root
+      ? index
+      : -1;
+  }
+
+  // Marks the lines in [from, to] as written by someone else, so the next
+  // render rewrites them even where the model shows no change. A composition
+  // records the lines it started over; whatever the IME leaves in them -
+  // split text nodes, styled spans, stray text - is the model's to replace.
+  markLinesDirty(from: number, to: number): void {
+    for (let i = Math.max(from, 0); i <= to && i < this.lines.length; i++) {
+      this.dirtyLines.add(this.lines[i]!);
+    }
   }
 
   // Drops the diff baseline, so the next `render` rebuilds every line from an
@@ -55,6 +92,9 @@ export class DomRenderer {
   invalidate(): void {
     this.renderedText = '';
     this.renderedParagraphs = [];
+    this.lines = [];
+    this.lineIndices = new WeakMap();
+    this.dirtyLines.clear();
     this.root.replaceChildren();
   }
 
@@ -79,12 +119,18 @@ export class DomRenderer {
     paragraphs: readonly ParagraphProjection[]
   ): void {
     const document = this.root.ownerDocument;
-    const { start, stalePairs, freshPairs } = changedWindow(
+    const window = changedWindow(
       this.renderedText,
       this.renderedParagraphs,
       text,
       paragraphs
     );
+    if (!this.linesIntact(window.start, window.stalePairs)) {
+      this.invalidate();
+      this.patch(text, paragraphs);
+      return;
+    }
+    const { start, stalePairs, freshPairs } = window;
     const patched = Math.min(stalePairs, freshPairs);
     const removed = stalePairs - patched;
     const inserted = freshPairs - patched;
@@ -92,24 +138,71 @@ export class DomRenderer {
     for (let i = 0; i < patched; i++) {
       patchParagraph(
         document,
-        this.root.children[start + i] as HTMLElement,
+        this.lines[start + i]!,
         text,
         paragraphs[start + i]!
       );
     }
-    for (let i = 0; i < removed; i++) {
-      this.root.children[start + patched]!.remove();
+
+    const spliceAt = start + patched;
+    if (removed > 0 || inserted > 0) {
+      for (let i = 0; i < removed; i++) {
+        this.lines[spliceAt + i]!.remove();
+      }
+      const suffixAnchor = this.lines[spliceAt + removed] ?? null;
+      const fresh: HTMLElement[] = [];
+      for (let i = 0; i < inserted; i++) {
+        const line = createParagraph(document, text, paragraphs[spliceAt + i]!);
+        this.root.insertBefore(line, suffixAnchor);
+        fresh.push(line);
+      }
+      // Not `splice(..., ...fresh)`: an initial render inserts every line, and
+      // spreading tens of thousands of arguments overflows the stack.
+      this.lines = this.lines
+        .slice(0, spliceAt)
+        .concat(fresh, this.lines.slice(spliceAt + removed));
+      // Equal counts shift nothing, so only the fresh lines need an index.
+      const reindexTo =
+        removed === inserted ? spliceAt + inserted : this.lines.length;
+      for (let i = spliceAt; i < reindexTo; i++) {
+        this.lineIndices.set(this.lines[i]!, i);
+      }
     }
-    const suffixAnchor = this.root.children[start + patched] ?? null;
-    for (let i = 0; i < inserted; i++) {
-      this.root.insertBefore(
-        createParagraph(document, text, paragraphs[start + patched + i]!),
-        suffixAnchor
-      );
+
+    for (const line of this.dirtyLines) {
+      const index = this.indexOfLine(line);
+      if (index !== -1) {
+        patchParagraph(document, line, text, paragraphs[index]!);
+      }
     }
+    this.dirtyLines.clear();
 
     this.renderedText = text;
     this.renderedParagraphs = [...paragraphs];
+  }
+
+  // Whether the root still holds exactly the lines this renderer wrote, as
+  // far as the coming patch depends on: nothing added or removed under the
+  // root, and every line the patch touches - plus the one it inserts before -
+  // still a child of it. A full walk would cost O(lines) per keystroke; the
+  // count catches anything added or dropped, and the window covers a line
+  // swapped for a foreign node.
+  private linesIntact(start: number, stalePairs: number): boolean {
+    if (this.root.childNodes.length !== this.lines.length) {
+      return false;
+    }
+    const end = Math.min(start + stalePairs, this.lines.length - 1);
+    for (let i = start; i <= end; i++) {
+      if (this.lines[i]!.parentNode !== this.root) {
+        return false;
+      }
+    }
+    for (const line of this.dirtyLines) {
+      if (line.parentNode !== this.root && this.lineIndices.has(line)) {
+        return false;
+      }
+    }
+    return true;
   }
 }
 
@@ -182,7 +275,7 @@ function sameRun(
   );
 }
 
-function classNameFor(styles: StyleRun['styles']): string {
+export function classNameFor(styles: StyleRun['styles']): string {
   return styles.map((style) => `enrm-${style}`).join(' ');
 }
 
@@ -239,13 +332,24 @@ function patchParagraph(
 }
 
 // A run span as `createRun` builds them: exactly one text node inside, which
-// is what `patchRun` writes through.
-function isReusableRun(node: Node): boolean {
-  return (
-    node.nodeName === 'SPAN' &&
-    node.childNodes.length === 1 &&
-    node.firstChild!.nodeType === Node.TEXT_NODE
-  );
+// is what `patchRun` writes through, and no attributes but the ones
+// `patchRun` manages. An IME or the browser's own editing can leave a span
+// with an inline `style` (or a `<font>`) behind, and reusing it would keep
+// that styling on text the model says is plain.
+export function isReusableRun(node: Node): boolean {
+  if (
+    node.nodeName !== 'SPAN' ||
+    node.childNodes.length !== 1 ||
+    node.firstChild!.nodeType !== Node.TEXT_NODE
+  ) {
+    return false;
+  }
+  for (const { name } of (node as Element).attributes) {
+    if (name !== 'class' && name !== 'data-url') {
+      return false;
+    }
+  }
+  return true;
 }
 
 function patchBlockAttributes(
@@ -300,7 +404,32 @@ function patchRun(span: HTMLElement, text: string, run: StyleRun): void {
 
   const content = text.slice(run.start, run.end);
   const textNode = span.firstChild as Text;
-  if (textNode.nodeValue !== content) {
-    textNode.nodeValue = content;
+  const current = textNode.data;
+  if (current !== content) {
+    replaceChangedData(textNode, current, content);
   }
+}
+
+// Rewrites only the window that differs, rather than assigning `nodeValue`.
+// A whole-value assignment collapses a live caret in the node to offset 0 and
+// drops Blink's spellcheck markers on the untouched words; `replaceData` over
+// the edit keeps both, and leaves a caret before a deletion where it was.
+function replaceChangedData(node: Text, current: string, next: string): void {
+  const maxShared = Math.min(current.length, next.length);
+  let prefix = 0;
+  while (prefix < maxShared && current[prefix] === next[prefix]) {
+    prefix++;
+  }
+  let suffix = 0;
+  while (
+    suffix < maxShared - prefix &&
+    current[current.length - 1 - suffix] === next[next.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  node.replaceData(
+    prefix,
+    current.length - prefix - suffix,
+    next.slice(prefix, next.length - suffix)
+  );
 }

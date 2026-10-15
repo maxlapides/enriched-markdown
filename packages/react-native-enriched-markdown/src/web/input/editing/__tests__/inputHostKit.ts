@@ -126,7 +126,26 @@ export function selectRangeFocused(
   document.dispatchEvent(new Event('selectionchange'));
 }
 
+// Plays the browser's part too: plain typing inside a run is left to the
+// browser (see `NativeEdit`), and jsdom performs no edits, so an uncancelled
+// `beforeinput` is followed here by the insert and the `input` a browser
+// would make.
 export function typeText(root: HTMLElement, data: string): void {
+  const event = new InputEvent('beforeinput', {
+    inputType: 'insertText',
+    data,
+    bubbles: true,
+    cancelable: true,
+  });
+  root.dispatchEvent(event);
+  if (!event.defaultPrevented) {
+    insertAtCaretAsBrowser(root, data);
+  }
+}
+
+// The bare event, with no browser behind it: for asserting what the host does
+// with an event it should not act on.
+export function dispatchTyping(root: HTMLElement, data: string): void {
   root.dispatchEvent(
     new InputEvent('beforeinput', {
       inputType: 'insertText',
@@ -134,6 +153,24 @@ export function typeText(root: HTMLElement, data: string): void {
       bubbles: true,
       cancelable: true,
     })
+  );
+}
+
+function insertAtCaretAsBrowser(root: HTMLElement, data: string): void {
+  const selection = document.getSelection()!;
+  const node = selection.anchorNode as Text;
+  const offset = selection.anchorOffset;
+  node.insertData(offset, data);
+  // A browser leaves the caret after what it typed; `insertData` alone
+  // leaves a caret at the insertion point before it.
+  selection.setBaseAndExtent(
+    node,
+    offset + data.length,
+    node,
+    offset + data.length
+  );
+  root.dispatchEvent(
+    new InputEvent('input', { inputType: 'insertText', data, bubbles: true })
   );
 }
 

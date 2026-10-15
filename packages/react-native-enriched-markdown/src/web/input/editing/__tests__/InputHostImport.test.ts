@@ -147,4 +147,22 @@ describe('InputHost imports', () => {
     await expect(importing).resolves.toBeUndefined();
     expect(root.childNodes).toHaveLength(0);
   });
+
+  // Rewriting every node under a running IME hands its leftovers to a
+  // read-back that diffs them against the new model.
+  it('an import that lands mid-composition waits for it to end', async () => {
+    const { root, host } = mount();
+    root.focus();
+    typeText(root, 'ab');
+    const finish = deferParse('loaded');
+    const importing = host.setValue('loaded');
+    root.dispatchEvent(new Event('compositionstart', { bubbles: true }));
+    await finish();
+
+    expect(root.textContent).toBe('ab');
+    root.dispatchEvent(new Event('compositionend', { bubbles: true }));
+    await importing;
+    expect(host.value).toBe('loaded');
+    expect(root.textContent).toBe('loaded');
+  });
 });

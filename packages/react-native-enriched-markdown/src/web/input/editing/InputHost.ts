@@ -4,14 +4,20 @@ import { parseToPlainTextAndRanges } from '../formatting/InputParser';
 import { serialize } from '../formatting/MarkdownSerializer';
 import type { RangeBounds } from '../model/rangeBounds';
 import { DomRenderer } from '../render/DomRenderer';
-import { projectParagraphs } from '../render/InputProjection';
+import { computeStyleRuns, projectParagraphs } from '../render/InputProjection';
 import { ENRM_INPUT_CLASS, injectInputStyles } from '../render/inputStyles';
 import { isListItem, type BlockType } from '../model/blocks';
 import type { PendingStyleType } from '../model/inlineStyles';
 import { BlockEditCoordinator } from './BlockEditCoordinator';
 import { EditPipeline } from './EditPipeline';
 import { EditSession } from './EditSession';
-import { SelectionMapper } from './SelectionMapper';
+import {
+  nativeEditLanded,
+  planNativeEdit,
+  spansMatchRuns,
+  type NativeEdit,
+} from './NativeEdit';
+import { SelectionMapper, type DomPosition } from './SelectionMapper';
 import { TypingAttributesController } from './TypingAttributesController';
 import { buildInputState, sameInputState, type InputState } from './InputState';
 import {
@@ -64,6 +70,21 @@ export class InputHost {
 
   private text = '';
   private selection: RangeBounds = { start: 0, end: 0 };
+  // Whether the selection runs from `end` back to `start`: the DOM's anchor
+  // is the end. Kept beside `selection` rather than in it because the bounds
+  // are what every consumer and callback reads.
+  private selectionBackward = false;
+  // Work that would write the DOM while an IME owns it - commands, imports,
+  // imperative selection moves - waits here for the composition to end.
+  private deferredUntilCompositionEnd: Array<() => void> = [];
+  // A mouse or touch selection in progress. Links snap to whole only once it
+  // ends, the way iOS waits for its selection gesture: rewriting the
+  // selection under a drag fights the browser for its anchor.
+  private pointerSelecting = false;
+  // An edit the browser was left to perform (see `NativeEdit`), already in
+  // the model and waiting for its `input` to be checked and rendered.
+  private pendingNativeEdit: { edit: NativeEdit; runCount: number } | null =
+    null;
   private destroyed = false;
   // Bumped by every import, so one still parsing can tell that a later import
   // has overtaken it. Only imports count: a user edit cannot race an import,
@@ -104,7 +125,9 @@ export class InputHost {
     this.setOwnedAttribute('translate', 'no');
 
     root.addEventListener('beforeinput', this.handleBeforeInput);
+    root.addEventListener('input', this.handleInput);
     root.addEventListener('keydown', this.handleKeyDown);
+    root.addEventListener('pointerdown', this.handlePointerDown);
     root.addEventListener('compositionstart', this.handleCompositionStart);
     root.addEventListener('compositionend', this.handleCompositionEnd);
     root.addEventListener('focus', this.handleFocus);
@@ -115,6 +138,8 @@ export class InputHost {
       'selectionchange',
       this.handleSelectionChange
     );
+    root.ownerDocument.addEventListener('pointerup', this.handlePointerUp);
+    root.ownerDocument.addEventListener('pointercancel', this.handlePointerUp);
 
     this.render();
   }
@@ -125,9 +150,13 @@ export class InputHost {
     }
     this.destroyed = true;
     this.session.endComposition();
+    this.deferredUntilCompositionEnd = [];
+    this.pendingNativeEdit = null;
 
     this.root.removeEventListener('beforeinput', this.handleBeforeInput);
+    this.root.removeEventListener('input', this.handleInput);
     this.root.removeEventListener('keydown', this.handleKeyDown);
+    this.root.removeEventListener('pointerdown', this.handlePointerDown);
     this.root.removeEventListener(
       'compositionstart',
       this.handleCompositionStart
@@ -140,6 +169,14 @@ export class InputHost {
     this.root.ownerDocument.removeEventListener(
       'selectionchange',
       this.handleSelectionChange
+    );
+    this.root.ownerDocument.removeEventListener(
+      'pointerup',
+      this.handlePointerUp
+    );
+    this.root.ownerDocument.removeEventListener(
+      'pointercancel',
+      this.handlePointerUp
     );
 
     // Leave nothing editable behind. A consumer that owns the node and keeps
@@ -193,24 +230,39 @@ export class InputHost {
     this.markdownEmitEnabled = enabled;
   }
 
+  // In the root's content coordinates, the way the natives report it: from
+  // the padding box's origin, with the root's own scroll offset added, so a
+  // scrolled editor reports where the caret sits in its content rather than
+  // on screen.
+  //
+  // Reads the DOM caret while the editor has focus. `selectionchange` is a
+  // queued task, so the model selection trails an arrow key until it fires,
+  // and a rect asked for in between would describe the old position.
   caretRect(): CaretRect | null {
-    const position = this.mapper.domPositionFromModelOffset(
-      this.selection.start
-    );
+    const domSelection = this.readDomSelection();
+    const offset = domSelection?.selection.start ?? this.selection.start;
+    const box = this.caretBoxAtOffset(offset);
+    if (box === null) {
+      return null;
+    }
+    const rootRect = this.root.getBoundingClientRect();
+    return {
+      x: box.left - rootRect.left - this.root.clientLeft + this.root.scrollLeft,
+      y: box.top - rootRect.top - this.root.clientTop + this.root.scrollTop,
+      // Nothing laid out (a detached editor) has no caret to give a width.
+      width: isZeroBox(box) ? 0 : caretWidth(this.root.ownerDocument),
+      height: box.height,
+    };
+  }
+
+  // The caret's box in viewport coordinates; all zeros where nothing is laid
+  // out.
+  private caretBoxAtOffset(offset: number): CaretBox | null {
+    const position = this.mapper.domPositionFromModelOffset(offset);
     if (position === null) {
       return null;
     }
-    const range = this.root.ownerDocument.createRange();
-    range.setStart(position.node, position.offset);
-    range.collapse(true);
-    const rect = caretRectOfRange(range, position.node);
-    const rootRect = this.root.getBoundingClientRect();
-    return {
-      x: rect.left - rootRect.left,
-      y: rect.top - rootRect.top,
-      width: rect.width,
-      height: rect.height,
-    };
+    return caretBoxAt(this.root.ownerDocument, position);
   }
 
   blur(): void {
@@ -247,13 +299,25 @@ export class InputHost {
     if (this.destroyed || generation !== this.importGeneration) {
       return false;
     }
+    // Rewriting every node under a running IME would hand its leftovers to a
+    // read-back that diffs them against the new model.
+    if (this.session.isComposing) {
+      await new Promise<void>((resolve) =>
+        this.deferredUntilCompositionEnd.push(resolve)
+      );
+      if (this.destroyed || generation !== this.importGeneration) {
+        return false;
+      }
+    }
 
     const { plainText, formattingRanges, blockRanges } = parsed;
+    this.settleNativeEdit();
     this.session.scoped('importing', () => {
       this.text = plainText;
       this.formattingStore.setRanges(formattingRanges);
       this.blockStore.setRanges(blockRanges);
       this.selection = { start: plainText.length, end: plainText.length };
+      this.selectionBackward = false;
     });
     this.render();
     return true;
@@ -263,35 +327,50 @@ export class InputHost {
   // reversed range collapses rather than flipping - and additionally snaps off
   // the seam inside a surrogate pair, which UIKit does for us there but which
   // nothing here would catch before the next edit split the pair.
+  //
+  // Links are atomic here as on both natives: a range is widened to cover
+  // any link it cuts, and a caret inside one moves to its end.
   setSelection(start: number, end: number): void {
+    this.settleNativeEdit();
+    if (this.deferWhileComposing(() => this.setSelection(start, end))) {
+      return;
+    }
     const max = this.text.length;
     const clampedStart = clamp(start, 0, max);
-    this.selection = {
+    const snapped = {
       start: codePointBoundaryAtOrBefore(this.text, clampedStart),
       end: codePointBoundaryAtOrBefore(
         this.text,
         clamp(end, clampedStart, max)
       ),
     };
-    this.render();
+    this.selection =
+      this.formattingStore.selectionAdjustedForAtomicLinks(
+        snapped.start,
+        snapped.end
+      ) ?? snapped;
+    this.selectionBackward = false;
+    // Nothing in the model changed, so there is nothing to render; only the
+    // DOM selection moves.
+    this.session.scoped('formatting', () => this.writeSelectionToDom());
     this.resetTypingAfterSelectionMove();
     this.emitSelectionMoved();
   }
 
   indentList(): void {
-    this.changeListDepthBy(1);
+    this.command(() => this.changeListDepthBy(1));
   }
 
   outdentList(): void {
-    this.changeListDepthBy(-1);
+    this.command(() => this.changeListDepthBy(-1));
   }
 
   toggleUnorderedList(): void {
-    this.toggleListType('unordered-list-item');
+    this.command(() => this.toggleListType('unordered-list-item'));
   }
 
   toggleOrderedList(): void {
-    this.toggleListType('ordered-list-item');
+    this.command(() => this.toggleListType('ordered-list-item'));
   }
 
   toggleBold(): void {
@@ -315,11 +394,45 @@ export class InputHost {
   }
 
   toggleHeading(level: number): void {
-    this.session.scoped('processing', () =>
-      this.blockCoordinator.toggleHeading(level, this.selection, this.text)
-    );
-    this.render();
-    this.emitFormattingChanged();
+    this.command(() => {
+      this.session.scoped('processing', () =>
+        this.blockCoordinator.toggleHeading(level, this.selection, this.text)
+      );
+      this.render();
+      this.emitFormattingChanged();
+    });
+  }
+
+  // A command issued mid-composition would rewrite the nodes under the IME
+  // (and move its caret), and a caret toggle would style the word still being
+  // composed. It runs once the composition has been read back instead.
+  private command(run: () => void): void {
+    this.settleNativeEdit();
+    if (!this.deferWhileComposing(run)) {
+      run();
+    }
+  }
+
+  private deferWhileComposing(run: () => void): boolean {
+    if (!this.session.isComposing) {
+      return false;
+    }
+    this.deferredUntilCompositionEnd.push(run);
+    return true;
+  }
+
+  private runDeferredCommands(): void {
+    const deferred = this.deferredUntilCompositionEnd;
+    this.deferredUntilCompositionEnd = [];
+    for (const run of deferred) {
+      if (this.destroyed || this.session.isComposing) {
+        // A new composition began from inside one of them; the rest wait
+        // for that one.
+        this.deferredUntilCompositionEnd.push(run);
+        continue;
+      }
+      run();
+    }
   }
 
   private readonly handleBeforeInput = (event: InputEvent): void => {
@@ -333,53 +446,75 @@ export class InputHost {
     if (event.isComposing || this.session.isComposing) {
       return;
     }
-    // Default-deny: unhandled input types become no-ops, never native edits.
-    event.preventDefault();
+    this.settleNativeEdit();
     // An import is parsing: the value the app asked for is about to replace
     // everything, so an edit now would be overwritten anyway.
+    if (this.pendingImports === 0 && this.letBrowserEdit(event)) {
+      return;
+    }
+    // Default-deny: unhandled input types become no-ops, never native edits.
+    event.preventDefault();
     if (this.pendingImports > 0) {
       return;
     }
     this.syncSelectionFromDom();
 
     switch (event.inputType) {
+      // Both carry their range on the event: plain typing addresses the
+      // selection, but autocorrect and spellcheck replacements address the
+      // word they correct, and Safari can deliver either as `insertText`.
       case 'insertText':
-        this.replaceSelection(event.data ?? '');
-        break;
-      // Autocorrect and spellcheck replacements address their own range
-      // rather than the selection.
       case 'insertReplacementText':
-        this.replaceTargetRange(event, replacementTextOf(event));
+        this.replaceTargetRange(event, insertedTextOf(event));
         break;
       case 'insertParagraph':
       case 'insertLineBreak':
         this.insertNewline();
         break;
+      // Deletes take the platform's range where it supplies one: what a word
+      // or a visual line is depends on the locale and the layout (Cmd+Backspace
+      // deletes to the start of the visual line, not the previous newline),
+      // and only the browser knows either. The scanners are the fallback for
+      // an engine that reports no target range.
       case 'deleteContentBackward':
         this.deleteBackwardTo(
+          event,
           this.selection.start -
             graphemeLengthBefore(this.text, this.selection.start)
         );
         break;
       case 'deleteContentForward':
         this.deleteForwardTo(
+          event,
           this.selection.end +
             graphemeLengthAfter(this.text, this.selection.end)
         );
         break;
       case 'deleteWordBackward':
-        this.deleteBackwardTo(wordStartBefore(this.text, this.selection.start));
+        this.deleteBackwardTo(
+          event,
+          wordStartBefore(this.text, this.selection.start)
+        );
         break;
       case 'deleteWordForward':
-        this.deleteForwardTo(wordEndAfter(this.text, this.selection.end));
+        this.deleteForwardTo(
+          event,
+          wordEndAfter(this.text, this.selection.end)
+        );
         break;
       case 'deleteSoftLineBackward':
       case 'deleteHardLineBackward':
-        this.deleteBackwardTo(lineStartBefore(this.text, this.selection.start));
+        this.deleteBackwardTo(
+          event,
+          lineStartBefore(this.text, this.selection.start)
+        );
         break;
       case 'deleteSoftLineForward':
       case 'deleteHardLineForward':
-        this.deleteForwardTo(lineEndAfter(this.text, this.selection.end));
+        this.deleteForwardTo(
+          event,
+          lineEndAfter(this.text, this.selection.end)
+        );
         break;
       // `deleteByCut` is the second half of a cut, which `handleCut` has
       // already performed; `insertFromPaste` likewise belongs to
@@ -402,15 +537,123 @@ export class InputHost {
     }
   };
 
-  private syncSelectionFromDom(): void {
-    const domSelection = this.root.ownerDocument.getSelection();
-    if (domSelection === null) {
+  // Takes the edit into the model and leaves the DOM to the browser, when the
+  // browser's edit is exactly what a render would write (see `NativeEdit`).
+  // Returns false, with nothing changed, for any edit that is not a
+  // candidate; true once the edit is handled either way - a candidate whose
+  // runs turn out to differ is cancelled here and rendered from the model.
+  private letBrowserEdit(event: InputEvent): boolean {
+    if (this.renderer.hasDirtyLines) {
+      return false;
+    }
+    const edit = planNativeEdit(event, {
+      root: this.root,
+      isLine: this.isRenderedLine,
+      modelOffsetFromDom: (node, offset) =>
+        this.mapper.modelOffsetFromDom(node, offset),
+    });
+    if (edit === null) {
+      return false;
+    }
+    const { editStart, deletedText, insertedText } = edit;
+    // A Backspace into a link deletes all of it, which is the model's edit
+    // to make.
+    if (
+      deletedText.length > 0 &&
+      this.formattingStore.isStyleActiveInRange(
+        'link',
+        editStart,
+        editStart + deletedText.length
+      )
+    ) {
+      return false;
+    }
+    this.syncSelectionFromDom();
+    this.applyModelEdit(editStart, deletedText, insertedText);
+    const line = lineAtPosition(editStart, this.text);
+    const runs = computeStyleRuns(
+      this.formattingStore.allRanges,
+      line.start,
+      line.end
+    );
+    if (!spansMatchRuns(edit, runs, this.text)) {
+      event.preventDefault();
+      this.renderEdit();
+      return true;
+    }
+    this.pendingNativeEdit = { edit, runCount: runs.length };
+    // `input` follows within the same task; the timer is for an engine that
+    // lets the event through and then performs nothing.
+    setTimeout(() => this.settleNativeEdit(), 0);
+    return true;
+  }
+
+  // Renders a native edit once the browser has made it. When it landed as
+  // planned the render finds every node already right, writes nothing, and
+  // leaves the caret alone - the point of the exercise. When it did not, the
+  // line is rewritten from the model.
+  private settleNativeEdit(): void {
+    const pending = this.pendingNativeEdit;
+    if (pending === null || this.destroyed) {
       return;
     }
-    const mapped = this.mapper.modelSelectionFromDom(domSelection);
-    if (mapped !== null) {
-      this.selection = mapped;
+    this.pendingNativeEdit = null;
+    if (
+      !nativeEditLanded(pending.edit, this.isRenderedLine, pending.runCount)
+    ) {
+      const index = this.renderer.indexOfLine(pending.edit.line);
+      if (index === -1) {
+        this.renderer.invalidate();
+      } else {
+        this.renderer.markLinesDirty(index, index);
+      }
     }
+    this.render();
+    this.emitTextEdited();
+  }
+
+  private readonly isRenderedLine = (node: Node): boolean =>
+    this.renderer.indexOfLine(node) !== -1;
+
+  private syncSelectionFromDom(): void {
+    const mapped = this.readDomSelection();
+    if (mapped !== null) {
+      this.selection = mapped.selection;
+      this.selectionBackward = mapped.backward;
+    }
+  }
+
+  // The DOM selection in model offsets, snapped off any surrogate seam the
+  // way `setSelection` snaps its arguments: a caret the browser parks inside
+  // a pair would otherwise split it on the next edit.
+  private readDomSelection(): {
+    selection: RangeBounds;
+    backward: boolean;
+  } | null {
+    const domSelection = this.root.ownerDocument.getSelection();
+    if (domSelection === null) {
+      return null;
+    }
+    const points = this.mapper.modelSelectionFromDom(domSelection);
+    if (points === null) {
+      return null;
+    }
+    const anchor = this.snapToModel(points.anchor);
+    const focus = this.snapToModel(points.focus);
+    return {
+      selection: {
+        start: Math.min(anchor, focus),
+        end: Math.max(anchor, focus),
+      },
+      backward: focus < anchor,
+    };
+  }
+
+  private snapToModel(offset: number): number {
+    return codePointBoundaryAtOrBefore(
+      this.text,
+      clamp(offset, 0, this.text.length)
+    );
   }
 
   // Tab never reaches beforeinput (the browser moves focus), so it is the
@@ -420,6 +663,7 @@ export class InputHost {
       return;
     }
     event.preventDefault();
+    this.settleNativeEdit();
     this.syncSelectionFromDom();
     if (event.shiftKey) {
       this.outdentList();
@@ -429,12 +673,88 @@ export class InputHost {
   };
 
   private readonly handleCompositionStart = (): void => {
+    this.settleNativeEdit();
+    if (this.pendingImports === 0) {
+      this.syncSelectionFromDom();
+    }
     this.session.beginComposition();
+    // The IME writes into the lines under the selection and leaves whatever
+    // node shapes it likes there; those lines get rewritten once it is done,
+    // even where the text it leaves matches the model.
+    this.renderer.markLinesDirty(
+      this.mapper.lineIndexAt(this.selection.start),
+      this.mapper.lineIndexAt(this.selection.end)
+    );
+    // The placeholder is drawn over the content box, and the composed text is
+    // in the DOM long before it is in the model.
+    this.root.toggleAttribute('data-empty', false);
   };
 
   private readonly handleCompositionEnd = (): void => {
+    this.endComposition();
+  };
+
+  private endComposition(): void {
     this.session.endComposition();
     this.recoverComposition();
+    this.runDeferredCommands();
+  }
+
+  // `input` arrives for every DOM change the browser made itself, which is
+  // never one of ours: a cancelled `beforeinput` raises none, and scripted
+  // writes raise none either. Two kinds reach here.
+  //
+  // Composition updates. The model follows them without rendering, so
+  // `value`, `onChangeText` and `getMarkdown` include the word being composed
+  // - on Chrome Android it stays composed until a space, and a Send button
+  // that keeps focus would otherwise drop it. Android native does the same
+  // with its composing span.
+  //
+  // Everything else is an edit that escaped `preventDefault`: Android Chrome
+  // on some `deleteContentBackward`, a non-cancelable input type,
+  // `execCommand`, an extension. It is read back like a composition so the
+  // model and the screen agree again.
+  private readonly handleInput = (event: Event): void => {
+    if (this.destroyed) {
+      return;
+    }
+    const composing =
+      (event as InputEvent).isComposing || this.session.isComposing;
+    if (!composing && this.pendingNativeEdit !== null) {
+      this.settleNativeEdit();
+      return;
+    }
+    if (composing) {
+      if (this.editable && this.pendingImports === 0) {
+        this.readBackFromDom({ render: false });
+      }
+      return;
+    }
+    this.renderer.markLinesDirty(
+      this.mapper.lineIndexAt(this.selection.start),
+      this.mapper.lineIndexAt(this.selection.end)
+    );
+    if (this.pendingImports > 0) {
+      // The import is about to replace everything; put the model back.
+      this.renderer.invalidate();
+      this.render();
+      return;
+    }
+    this.recoverComposition();
+  };
+
+  private readonly handlePointerDown = (event: PointerEvent): void => {
+    this.pointerSelecting = event.isPrimary && event.button === 0;
+  };
+
+  private readonly handlePointerUp = (): void => {
+    if (!this.pointerSelecting) {
+      return;
+    }
+    this.pointerSelecting = false;
+    // The gesture's last selection change came while it was still running
+    // and was left unsnapped.
+    this.handleSelectionChange();
   };
 
   private readonly handleFocus = (): void => {
@@ -453,8 +773,7 @@ export class InputHost {
     // `compositionend`, and a latched composition flag makes the editor
     // read-only: every `beforeinput` short-circuits.
     if (this.session.isComposing) {
-      this.session.endComposition();
-      this.recoverComposition();
+      this.endComposition();
     }
   };
 
@@ -482,6 +801,7 @@ export class InputHost {
     if (!this.editable || this.session.isComposing || this.pendingImports > 0) {
       return;
     }
+    this.settleNativeEdit();
     this.syncSelectionFromDom();
     const { start, end } = this.selection;
     if (start === end) {
@@ -496,6 +816,7 @@ export class InputHost {
     if (!this.editable || this.session.isComposing || this.pendingImports > 0) {
       return;
     }
+    this.settleNativeEdit();
     // Plain text only. Pasting markdown as formatted content means running
     // the parser and merging an import into the middle of the buffer, which
     // is a separate concern from this shell.
@@ -530,18 +851,28 @@ export class InputHost {
     if (!this.hasFocus()) {
       return;
     }
+    this.settleNativeEdit();
     const domSelection = this.root.ownerDocument.getSelection();
-    if (domSelection === null) {
+    const read = this.readDomSelection();
+    if (domSelection === null || read === null) {
       return;
     }
-    const mapped = this.mapper.modelSelectionFromDom(domSelection);
-    if (mapped === null) {
-      return;
-    }
+    // Links are atomic: a caret inside one moves to its end and a range
+    // cutting one widens over it, as on both natives. Not while a pointer
+    // gesture is still selecting; `handlePointerUp` comes back for it.
+    const atomic = this.pointerSelecting
+      ? null
+      : this.formattingStore.selectionAdjustedForAtomicLinks(
+          read.selection.start,
+          read.selection.end
+        );
+    const mapped = atomic ?? read.selection;
+    const backward = atomic === null ? read.backward : false;
     if (
       mapped.start === this.selection.start &&
       mapped.end === this.selection.end
     ) {
+      this.selectionBackward = backward;
       // The comparison has to be in model offsets rather than on node
       // identity: a render replaces the nodes the selection pointed into, so
       // the echo of our own write arrives pointing somewhere else entirely
@@ -552,20 +883,29 @@ export class InputHost {
       // range inside it map to the one model offset, so a stretched highlight
       // reports as a collapsed caret. The model did not move, so nothing is
       // emitted, but the DOM still shows the highlight and needs the write.
-      if (domSelection.isCollapsed !== (mapped.start === mapped.end)) {
-        this.render();
+      if (
+        atomic !== null ||
+        domSelection.isCollapsed !== (mapped.start === mapped.end)
+      ) {
+        this.session.scoped('formatting', () => this.writeSelectionToDom());
       }
       return;
     }
     this.selection = mapped;
+    this.selectionBackward = backward;
+    if (atomic !== null) {
+      this.session.scoped('formatting', () => this.writeSelectionToDom());
+    }
     this.resetTypingAfterSelectionMove();
     this.emitSelectionMoved();
   };
 
+  // Every selection change that reaches here is the user's: the echo of our
+  // own caret write maps back to the offsets already held and is swallowed
+  // above, so no time window is needed to tell the two apart. (iOS keeps a
+  // 100 ms one; Android a one-shot flag.)
   private resetTypingAfterSelectionMove(): void {
-    if (!this.session.isPostEditGracePeriod) {
-      this.typing.resetForSelectionChange(this.selection);
-    }
+    this.typing.resetForSelectionChange(this.selection);
   }
 
   // The browser owns the DOM through a composition, so the composed text
@@ -579,22 +919,43 @@ export class InputHost {
   // their text is not there - and whatever nodes the IME left behind go on
   // confusing the selection mapping. The scope is wider than CJK: macOS dead
   // keys, iOS Safari autocorrect and GBoard suggestions all compose.
-  private readBackFromDom(): void {
+  //
+  // The diff is anchored on the DOM caret. The shared prefix and suffix of
+  // the two buffers overlap whenever the edit sits next to a copy of itself -
+  // composing `a` in front of `apple`, `l` into `helo` - and the longest
+  // prefix then puts the edit, and the model caret, one character too far.
+  // `render: false` is the mid-composition update: the model follows the
+  // DOM, but the DOM is the IME's until it ends.
+  private readBackFromDom({ render = true }: { render?: boolean } = {}): void {
     if (this.destroyed) {
       return;
     }
-    const domText = readTextFromDom(this.root);
+    const domSelection = this.root.ownerDocument.getSelection();
+    const focus =
+      domSelection?.focusNode != null &&
+      this.root.contains(domSelection.focusNode)
+        ? { node: domSelection.focusNode, offset: domSelection.focusOffset }
+        : null;
+    const { text: domText, caret } = readTextFromDom(this.root, focus);
     if (domText === this.text) {
       // Nothing to recover, but the IME may still have left non-canonical
-      // nodes behind; a render replaces them.
-      this.render();
+      // nodes behind. The lines it touched were marked dirty when it
+      // started, so this render rewrites them even though the model is
+      // unchanged.
+      if (render) {
+        this.render();
+      }
       return;
     }
     const { editStart, deletedText, insertedText } = diffEdit(
       this.text,
-      domText
+      domText,
+      caret
     );
-    this.applyEdit(editStart, deletedText, insertedText);
+    this.applyEdit(editStart, deletedText, insertedText, {
+      caret: caret === null ? undefined : caret,
+      render,
+    });
   }
 
   private insertNewline(): void {
@@ -640,6 +1001,7 @@ export class InputHost {
   }
 
   private toggleListType(type: BlockType): void {
+    // Also reached from Enter and Backspace, which never run mid-composition.
     this.session.scoped('processing', () =>
       this.blockCoordinator.toggleListType(type, this.selection, this.text)
     );
@@ -648,17 +1010,25 @@ export class InputHost {
   }
 
   private toggleInlineStyle(type: PendingStyleType): void {
-    const { start, end } = this.selection;
-    const wasActive = this.session.scoped('processing', () =>
-      this.formattingStore.toggleStyle(type, start, end)
-    );
-    this.typing.toggleStyle(type, wasActive, start !== end);
-    this.render();
-    this.emitFormattingChanged();
+    this.command(() => {
+      const { start, end } = this.selection;
+      const wasActive = this.session.scoped('processing', () =>
+        this.formattingStore.toggleStyle(type, start, end)
+      );
+      this.typing.toggleStyle(type, wasActive, start !== end);
+      if (start === end) {
+        // A caret toggle only pends a style for the next keystroke; the
+        // stores, and so the DOM and the markdown, are unchanged.
+        this.emitState();
+        return;
+      }
+      this.render();
+      this.emitFormattingChanged();
+    });
   }
 
   insertText(text: string): void {
-    this.replaceSelection(text);
+    this.command(() => this.replaceSelection(text));
   }
 
   private replaceSelection(insertedText: string): void {
@@ -666,9 +1036,12 @@ export class InputHost {
     this.applyEdit(start, this.text.slice(start, end), insertedText);
   }
 
+  // The event's own range where it carries one, the selection otherwise - an
+  // `insertReplacementText` without target ranges still replaces what is
+  // selected rather than being dropped.
   private replaceTargetRange(event: InputEvent, insertedText: string): void {
-    const target = this.modelRangeFromTargetRanges(event);
-    if (target === null) {
+    const target = this.modelRangeFromTargetRanges(event) ?? this.selection;
+    if (insertedText.length === 0 && target.start === target.end) {
       return;
     }
     this.applyEdit(
@@ -698,14 +1071,17 @@ export class InputHost {
     if (start === null || end === null) {
       return null;
     }
-    return { start: Math.min(start, end), end: Math.max(start, end) };
+    const from = this.snapToModel(Math.min(start, end));
+    const to = this.snapToModel(Math.max(start, end));
+    return { start: from, end: to };
   }
 
-  // Deletes back to `target`. A target that makes no progress - a word or
-  // line delete with the caret already at a line start - falls back to one
+  // Deletes back to the event's target range, or to `fallback` where the
+  // engine reports none. A target that makes no progress - a word or line
+  // delete with the caret already at a line start - falls back to one
   // character, which is the newline, so the press joins the lines instead of
   // doing nothing.
-  private deleteBackwardTo(target: number): void {
+  private deleteBackwardTo(event: InputEvent, fallback: number): void {
     const { start, end } = this.selection;
     if (start !== end) {
       this.replaceSelection('');
@@ -714,12 +1090,22 @@ export class InputHost {
     if (this.outdentListAtLineStart(start) || start === 0) {
       return;
     }
+    if (this.deleteLinkBefore(start)) {
+      return;
+    }
+    const target = this.modelRangeFromTargetRanges(event);
+    if (target !== null && target.start < target.end) {
+      this.deleteRange(target);
+      return;
+    }
     const from =
-      target < start ? target : start - graphemeLengthBefore(this.text, start);
+      fallback < start
+        ? fallback
+        : start - graphemeLengthBefore(this.text, start);
     this.applyEdit(from, this.text.slice(from, start), '');
   }
 
-  private deleteForwardTo(target: number): void {
+  private deleteForwardTo(event: InputEvent, fallback: number): void {
     const { start, end } = this.selection;
     if (start !== end) {
       this.replaceSelection('');
@@ -728,17 +1114,66 @@ export class InputHost {
     if (end >= this.text.length) {
       return;
     }
+    const target = this.modelRangeFromTargetRanges(event);
+    if (target !== null && target.start < target.end) {
+      this.deleteRange(target);
+      return;
+    }
     const to =
-      target > end ? target : end + graphemeLengthAfter(this.text, end);
+      fallback > end ? fallback : end + graphemeLengthAfter(this.text, end);
     this.applyEdit(end, this.text.slice(end, to), '');
+  }
+
+  private deleteRange({ start, end }: RangeBounds): void {
+    this.applyEdit(start, this.text.slice(start, end), '');
+  }
+
+  // Backspace with the caret on a link's last character, or anywhere inside
+  // it, deletes the whole link rather than leaving a partial one pointing at
+  // the old url. Both natives do this (iOS `deleteLinkForReplacementRange:`,
+  // Android `deleteLinkBeforeCursor`).
+  private deleteLinkBefore(caret: number): boolean {
+    const link = this.formattingStore.rangeOfType('link', caret - 1);
+    if (link === null) {
+      return false;
+    }
+    this.applyEdit(link.start, this.text.slice(link.start, link.end), '');
+    return true;
   }
 
   // The native keystroke choreography: model phase, render phase, then
   // events, in the iOS order.
+  //
+  // `caret` overrides where the caret lands, for a read-back that knows it
+  // from the DOM; `render: false` leaves the DOM alone, for one that runs
+  // while the IME still owns it.
   private applyEdit(
     editStart: number,
     deletedText: string,
-    insertedText: string
+    insertedText: string,
+    { caret, render = true }: { caret?: number; render?: boolean } = {}
+  ): void {
+    this.applyModelEdit(editStart, deletedText, insertedText, caret);
+    if (render) {
+      this.renderEdit();
+    } else {
+      this.emitTextEdited();
+    }
+  }
+
+  private renderEdit(): void {
+    this.render();
+    this.scrollCaretIntoView();
+    this.emitTextEdited();
+  }
+
+  // The model half of an edit: text, stores and caret, without touching the
+  // DOM or reporting anything.
+  private applyModelEdit(
+    editStart: number,
+    deletedText: string,
+    insertedText: string,
+    caret?: number
   ): void {
     this.session.scoped('processing', () => {
       this.text =
@@ -752,15 +1187,35 @@ export class InputHost {
         pendingStyles: this.typing.styles,
         pendingStyleRemovals: this.typing.styleRemovals,
       });
-      const caret = editStart + insertedText.length;
-      this.selection = { start: caret, end: caret };
-      this.session.recordTextChange();
+      const landing = this.snapToModel(
+        caret ?? editStart + insertedText.length
+      );
+      this.selection = { start: landing, end: landing };
+      this.selectionBackward = false;
     });
-    this.render();
-    this.emitTextEdited();
+  }
+
+  // A scripted caret write does not scroll, unlike a caret the browser moves
+  // itself: typing or Enter at the bottom of a scrolled editor would leave
+  // the caret below the box. Only after edits - a selection the user moved is
+  // already where they are looking.
+  private scrollCaretIntoView(): void {
+    if (!this.hasFocus()) {
+      return;
+    }
+    const box = this.caretBoxAtOffset(this.selection.end);
+    if (box !== null && !isZeroBox(box)) {
+      scrollBoxIntoView(this.root, box);
+    }
   }
 
   private render(): void {
+    // The IME owns the DOM until the composition ends, and every path that
+    // gets here mid-composition is deferred or reads back without rendering;
+    // the render that follows `compositionend` catches up.
+    if (this.session.isComposing) {
+      return;
+    }
     this.session.scoped('formatting', () => {
       this.root.toggleAttribute(
         'data-empty',
@@ -779,36 +1234,39 @@ export class InputHost {
   }
 
   private writeSelectionToDom(): void {
-    if (!this.hasFocus()) {
+    // Moving the selection under an IME moves its composition with it.
+    if (!this.hasFocus() || this.session.isComposing) {
       return;
     }
     const domSelection = this.root.ownerDocument.getSelection();
     if (domSelection === null) {
       return;
     }
+    const { start, end } = this.selection;
+    const collapsed = start === end;
+    const anchorOffset = this.selectionBackward ? end : start;
+    const focusOffset = this.selectionBackward ? start : end;
     const current = this.mapper.modelSelectionFromDom(domSelection);
-    const collapsed = this.selection.start === this.selection.end;
     if (
       current !== null &&
-      current.start === this.selection.start &&
-      current.end === this.selection.end &&
+      current.anchor === anchorOffset &&
+      current.focus === focusOffset &&
       domSelection.isCollapsed === collapsed
     ) {
       return;
     }
-    const start = this.mapper.domPositionFromModelOffset(this.selection.start);
-    const end =
-      this.selection.start === this.selection.end
-        ? start
-        : this.mapper.domPositionFromModelOffset(this.selection.end);
-    if (start === null || end === null) {
+    const anchor = this.mapper.domPositionFromModelOffset(anchorOffset);
+    const focus = collapsed
+      ? anchor
+      : this.mapper.domPositionFromModelOffset(focusOffset);
+    if (anchor === null || focus === null) {
       return;
     }
     domSelection.setBaseAndExtent(
-      start.node,
-      start.offset,
-      end.node,
-      end.offset
+      anchor.node,
+      anchor.offset,
+      focus.node,
+      focus.offset
     );
   }
 
@@ -892,27 +1350,140 @@ interface CaretBox {
   height: number;
 }
 
-// The box of a collapsed range, with the empty-line case covered. A range
-// collapsed at an element boundary has no client rects in Blink or WebKit, and
-// `getBoundingClientRect` answers an all-zero box there rather than a
-// position - which is exactly where an empty line's caret sits, because the
-// line renders as a lone `<br>` and the mapper resolves it to the paragraph
-// element itself. Subtracting the root's position from that zero box reports
-// the negated root position, so the line's own box stands in instead.
-function caretRectOfRange(range: Range, node: Node): CaretBox {
-  const rect = range.getBoundingClientRect();
+// The viewport box of a caret at `position`.
+//
+// The last client rect, not the bounding one: at the start of a soft-wrapped
+// visual line the collapsed range reports a rect on each side of the wrap,
+// and the bounding box of the two is anchored at the previous line's end.
+//
+// A range collapsed at an element boundary has no client rects in Blink or
+// WebKit, and `getBoundingClientRect` answers an all-zero box there rather
+// than a position - which is exactly where an empty line's caret sits,
+// because the line renders as a lone `<br>` and the mapper resolves it to the
+// line element itself. The `<br>` stands in there: it sits where the caret
+// does, after any list indent and on the RTL side, and is as tall as the text
+// rather than the line box.
+function caretBoxAt(document: Document, position: DomPosition): CaretBox {
+  const range = document.createRange();
+  range.setStart(position.node, position.offset);
+  range.collapse(true);
+  // Neither is implemented by every DOM (jsdom has neither).
+  if (typeof range.getClientRects === 'function') {
+    const rects = range.getClientRects();
+    const last = rects.length > 0 ? rects[rects.length - 1]! : null;
+    if (last !== null && !isZeroBox(last)) {
+      return last;
+    }
+  }
+  const rect =
+    typeof range.getBoundingClientRect === 'function'
+      ? range.getBoundingClientRect()
+      : ZERO_BOX;
   if (!isZeroBox(rect)) {
     return rect;
   }
   const element =
-    node.nodeType === Node.ELEMENT_NODE
-      ? (node as Element)
-      : node.parentElement;
-  const line = element?.getBoundingClientRect();
-  if (line === undefined || isZeroBox(line)) {
+    position.node.nodeType === Node.ELEMENT_NODE
+      ? (position.node as Element)
+      : position.node.parentElement;
+  if (element === null) {
     return rect;
   }
-  return { left: line.left, top: line.top, width: 0, height: line.height };
+  for (const candidate of [lineBreakOf(element), element]) {
+    const box = candidate?.getBoundingClientRect();
+    if (box !== undefined && !isZeroBox(box)) {
+      return { left: box.left, top: box.top, width: 0, height: box.height };
+    }
+  }
+  return rect;
+}
+
+function lineBreakOf(line: Element): Element | null {
+  for (const child of line.children) {
+    if (child.nodeName === 'BR') {
+      return child;
+    }
+  }
+  return null;
+}
+
+const ZERO_BOX: CaretBox = { left: 0, top: 0, width: 0, height: 0 };
+
+// Two physical pixels, as Android reports it (`2f / density`).
+function caretWidth(document: Document): number {
+  return 2 / (document.defaultView?.devicePixelRatio || 1);
+}
+
+// Scrolls every scrolling ancestor of `element`, then the viewport, by the
+// least that brings `box` into view - `scrollIntoView({ block: 'nearest' })`
+// for a rect rather than an element. Scrolling the caret's run span instead
+// would align a multi-line run by its edge, not by the caret.
+function scrollBoxIntoView(element: HTMLElement, box: CaretBox): void {
+  const document = element.ownerDocument;
+  const view = document.defaultView;
+  let { top, left } = box;
+  const { width, height } = box;
+  for (
+    let current: HTMLElement | null = element;
+    current !== null &&
+    current !== document.body &&
+    current !== document.documentElement;
+    current = current.parentElement
+  ) {
+    if (!isScrollContainer(current)) {
+      continue;
+    }
+    const rect = current.getBoundingClientRect();
+    const viewTop = rect.top + current.clientTop;
+    const viewLeft = rect.left + current.clientLeft;
+    const dy = scrollDelta(top, height, viewTop, current.clientHeight);
+    const dx = scrollDelta(left, width, viewLeft, current.clientWidth);
+    if (dy === 0 && dx === 0) {
+      continue;
+    }
+    const scrollTop = current.scrollTop;
+    const scrollLeft = current.scrollLeft;
+    current.scrollTop += dy;
+    current.scrollLeft += dx;
+    top -= current.scrollTop - scrollTop;
+    left -= current.scrollLeft - scrollLeft;
+  }
+  if (view === null) {
+    return;
+  }
+  const dy = scrollDelta(top, height, 0, view.innerHeight);
+  const dx = scrollDelta(left, width, 0, view.innerWidth);
+  if (dy !== 0 || dx !== 0) {
+    view.scrollBy(dx, dy);
+  }
+}
+
+function scrollDelta(
+  start: number,
+  size: number,
+  viewStart: number,
+  viewSize: number
+): number {
+  if (start < viewStart) {
+    return start - viewStart;
+  }
+  const overflow = start + size - (viewStart + viewSize);
+  // A box taller than the view keeps its start in view.
+  return overflow > 0 ? Math.min(overflow, start - viewStart) : 0;
+}
+
+function isScrollContainer(element: HTMLElement): boolean {
+  if (
+    element.scrollHeight <= element.clientHeight &&
+    element.scrollWidth <= element.clientWidth
+  ) {
+    return false;
+  }
+  const style = element.ownerDocument.defaultView?.getComputedStyle(element);
+  return (
+    style !== undefined &&
+    /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflowX}`)
+  );
 }
 
 function isZeroBox(box: CaretBox): boolean {
@@ -929,10 +1500,12 @@ function setAttributeIfAbsent(
   }
 }
 
-// `insertReplacementText` carries its text on `data` in some engines and in
-// the data transfer in others.
-function replacementTextOf(event: InputEvent): string {
-  return event.data ?? event.dataTransfer?.getData('text/plain') ?? '';
+// `insertText` and `insertReplacementText` carry their text on `data` in some
+// engines and in the data transfer in others.
+function insertedTextOf(event: InputEvent): string {
+  return normalizeLineEndings(
+    event.data ?? event.dataTransfer?.getData('text/plain') ?? ''
+  );
 }
 
 // The buffer uses bare newlines, so a clipboard's line endings are converted
@@ -942,54 +1515,119 @@ function normalizeLineEndings(text: string): string {
 }
 
 // Recovers the plain text the DOM currently shows, in the shape `render`
-// writes it: one line per element child of the root.
-function readTextFromDom(root: HTMLElement): string {
+// writes it: one line per element child of the root. Also places `point` (the
+// DOM caret) in that text, or answers null when it is not inside the root.
+//
+// Reads whatever the DOM holds, canonical or not, so the caret is placed by
+// walking the same nodes rather than through the mapper, which only knows the
+// renderer's own lines.
+export function readTextFromDom(
+  root: HTMLElement,
+  point: DomPosition | null = null
+): { text: string; caret: number | null } {
   const lines: string[] = [];
-  for (const node of root.childNodes) {
-    if (node.nodeType === Node.ELEMENT_NODE) {
-      lines.push(node.textContent ?? '');
-      continue;
-    }
+  // Length of `lines.join('\n')` so far.
+  let length = 0;
+  let caret: number | null = null;
+  const children = root.childNodes;
+  for (let i = 0; i < children.length; i++) {
+    const node = children[i]!;
+    const isLine = node.nodeType === Node.ELEMENT_NODE;
+    const text = node.textContent ?? '';
     // A text node an IME or an extension dropped directly under the root
     // belongs to the line it was dropped beside, not to a line of its own.
-    const text = node.textContent ?? '';
-    if (text.length === 0) {
+    const startsLine = isLine || lines.length === 0;
+    const nodeStart = startsLine && lines.length > 0 ? length + 1 : length;
+    if (point !== null && caret === null) {
+      if (point.node === root && point.offset === i) {
+        caret = nodeStart;
+      } else if (point.node === node || node.contains(point.node)) {
+        caret = nodeStart + textLengthWithin(node, point);
+      }
+    }
+    if (!isLine && text.length === 0) {
       continue;
     }
-    if (lines.length === 0) {
+    if (startsLine) {
       lines.push(text);
     } else {
       lines[lines.length - 1] += text;
     }
+    length = nodeStart + text.length;
   }
-  return lines.join('\n');
+  if (point !== null && caret === null && point.node === root) {
+    caret = length;
+  }
+  return { text: lines.join('\n'), caret };
+}
+
+// The length of the text inside `container` before `point`, which lies in it.
+function textLengthWithin(container: Node, point: DomPosition): number {
+  if (point.node === container && point.node.nodeType === Node.TEXT_NODE) {
+    return Math.min(point.offset, (container as Text).length);
+  }
+  const range = container.ownerDocument!.createRange();
+  range.setStart(container, 0);
+  range.setEnd(
+    point.node,
+    Math.min(
+      point.offset,
+      point.node.nodeType === Node.TEXT_NODE
+        ? (point.node as Text).length
+        : point.node.childNodes.length
+    )
+  );
+  return range.toString().length;
 }
 
 // The one contiguous edit between two buffers, bounded by their shared prefix
 // and suffix. A composition commits as a single replacement, so one window is
 // all there is to find.
-function diffEdit(
+//
+// Where the shared prefix and suffix overlap, the edit could sit anywhere in
+// the overlap (`a` + `apple` is an insert at 0 or at 1), and `caret` - where
+// the DOM caret is in `next` - picks the placement that ends the inserted
+// text at it, the way ProseMirror's `findDiff` does. Without a caret the
+// longest prefix wins.
+export function diffEdit(
   previous: string,
-  next: string
+  next: string,
+  caret: number | null = null
 ): { editStart: number; deletedText: string; insertedText: string } {
   const maxShared = Math.min(previous.length, next.length);
 
-  let prefix = 0;
-  while (prefix < maxShared && previous[prefix] === next[prefix]) {
-    prefix++;
+  let commonPrefix = 0;
+  while (
+    commonPrefix < maxShared &&
+    previous[commonPrefix] === next[commonPrefix]
+  ) {
+    commonPrefix++;
   }
+  let commonSuffix = 0;
+  while (
+    commonSuffix < maxShared &&
+    previous[previous.length - 1 - commonSuffix] ===
+      next[next.length - 1 - commonSuffix]
+  ) {
+    commonSuffix++;
+  }
+
+  let prefix = commonPrefix;
+  if (caret !== null && commonPrefix + commonSuffix > maxShared) {
+    // The suffix that ends the inserted text at the caret, kept within the
+    // range where both windows still hold.
+    prefix = clamp(
+      maxShared - next.length + caret,
+      maxShared - commonSuffix,
+      commonPrefix
+    );
+  }
+  let suffix = Math.min(commonSuffix, maxShared - prefix);
+
   // The stores index code units, so a boundary inside a surrogate pair would
   // leave half a character on each side of the edit.
   while (prefix > 0 && !isCodePointBoundary(next, prefix)) {
     prefix--;
-  }
-
-  let suffix = 0;
-  while (
-    suffix < maxShared - prefix &&
-    previous[previous.length - 1 - suffix] === next[next.length - 1 - suffix]
-  ) {
-    suffix++;
   }
   while (suffix > 0 && !isCodePointBoundary(next, next.length - suffix)) {
     suffix--;

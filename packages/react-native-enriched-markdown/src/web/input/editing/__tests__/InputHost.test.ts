@@ -5,6 +5,7 @@ import { InputHost } from '../InputHost';
 import {
   caretAt,
   compose,
+  dispatchTyping,
   lastState,
   mount,
   pressTab,
@@ -161,7 +162,7 @@ describe('InputHost', () => {
       const { root, host } = mount();
       typeText(root, 'ab');
       root.dispatchEvent(new Event('compositionstart', { bubbles: true }));
-      typeText(root, 'X');
+      dispatchTyping(root, 'X');
 
       expect(host.value).toBe('ab');
     });
@@ -480,40 +481,30 @@ describe('InputHost', () => {
       expect(styledText(root, style)).toEqual(['bc']);
     });
 
-    // A caret moved by the user abandons the toggle they never used; a caret
-    // moved by their own keystroke must not, or the pending style would be
-    // dropped before the character it was meant for arrives. The two are told
-    // apart by the post-edit grace period, so these drive the clock.
+    // A caret moved by the user abandons the toggle they never used, however
+    // soon after the last keystroke it moves. The echo of the host's own
+    // caret write maps back to the offsets already held and never reaches the
+    // reset, so no time window is needed to tell the two apart.
     describe('a pending toggle across a selection change', () => {
-      let now: jest.SpyInstance<number, []>;
-
-      beforeEach(() => {
-        now = jest.spyOn(performance, 'now').mockReturnValue(0);
-      });
-
-      afterEach(() => {
-        now.mockRestore();
-      });
-
-      it('survives a selection change inside the grace period', () => {
+      it('is abandoned by a selection change right after an edit', () => {
         const { root, host } = mount();
         typeText(root, 'abcd');
         host.toggleBold();
-        selectRangeFocused(root, 2, 2);
-        typeText(root, 'X');
-
-        expect(styledText(root, 'strong')).toEqual(['X']);
-      });
-
-      it('is abandoned by a selection change after it', () => {
-        const { root, host } = mount();
-        typeText(root, 'abcd');
-        host.toggleBold();
-        now.mockReturnValue(1000);
         selectRangeFocused(root, 2, 2);
         typeText(root, 'X');
 
         expect(styledText(root, 'strong')).toEqual([]);
+      });
+
+      it('survives the echo of its own caret write', () => {
+        const { root, host } = mount();
+        root.focus();
+        typeText(root, 'abcd');
+        host.toggleBold();
+        document.dispatchEvent(new Event('selectionchange'));
+        typeText(root, 'X');
+
+        expect(styledText(root, 'strong')).toEqual(['X']);
       });
 
       it('inherits the run the caret lands in', () => {
@@ -521,7 +512,6 @@ describe('InputHost', () => {
         typeText(root, 'abcd');
         selectRangeFocused(root, 1, 3);
         host.toggleBold();
-        now.mockReturnValue(1000);
         selectRangeFocused(root, 3, 3);
         typeText(root, 'X');
 
@@ -639,7 +629,7 @@ describe('InputHost', () => {
       const { root, host } = mount();
       typeText(root, 'ab');
       host.destroy();
-      typeText(root, 'c');
+      dispatchTyping(root, 'c');
 
       expect(host.value).toBe('ab');
     });
