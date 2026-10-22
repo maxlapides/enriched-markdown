@@ -75,7 +75,19 @@ class EnrichedMarkdown(
   private var forceHeightRecalculationCounter = 0
 
   var tableStreamingMode: TableStreamingMode = TableStreamingMode.PROGRESSIVE
+    set(value) {
+      if (field == value) return
+      field = value
+      dirtyFlags += DirtyFlag.FORCE_HEIGHT
+      renderPending = true
+    }
   var codeBlockStreamingMode: CodeBlockStreamingMode = CodeBlockStreamingMode.PROGRESSIVE
+    set(value) {
+      if (field == value) return
+      field = value
+      dirtyFlags += DirtyFlag.FORCE_HEIGHT
+      renderPending = true
+    }
   private var renderPending: Boolean = false
 
   var currentMarkdown: String = ""
@@ -190,8 +202,6 @@ class EnrichedMarkdown(
   }
 
   fun commitProps() {
-    MeasurementStore.updateStreamingTableMode(id, tableStreamingMode)
-    MeasurementStore.updateStreamingCodeBlockMode(id, codeBlockStreamingMode)
     MeasurementStore.updateFontScalingSettings(id, allowFontScaling, maxFontSizeMultiplier)
     if (renderPending) {
       renderPending = false
