@@ -1,4 +1,4 @@
-import type { LinkRecognition } from './MarkdownTextProps';
+import type { LinkRecognition } from './linkRecognition';
 import type { CSSProperties, HTMLAttributes } from 'react';
 import type { MarkdownStyle, Md4cFlags } from './MarkdownStyle';
 import type {

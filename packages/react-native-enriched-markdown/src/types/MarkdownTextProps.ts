@@ -10,24 +10,12 @@ import type {
   LatexErrorEvent,
   CodeBlockPressEvent,
 } from './events';
+import type { LinkPillContent } from './linkPill';
+import type { LinkRecognition } from './linkRecognition';
 
-/** Patterns for `linkRecognition`. An omitted key is off. */
-export interface LinkRecognition {
-  /** Matched inside plain-text runs. */
-  text?: RegExp;
-  /** Must match an inline-code span's whole content. */
-  inlineCode?: RegExp;
-}
-
-export interface LinkPillContent {
-  label?: string;
-  iconUri?: string;
-  /**
-   * Tint for this link's icon. The variant's `pill.iconTintColor` is not applied
-   * to an icon set here through `iconUri`.
-   */
-  iconTintColor?: string;
-}
+// Defined apart so code shared with web can import them: under a `.web`
+// module suffix this file resolves to `MarkdownTextProps.web.ts`.
+export type { LinkPillContent, LinkRecognition };
 
 /**
  * An item of a link's long-press menu. `text` identifies the item, so it must be
@@ -263,6 +251,19 @@ export interface EnrichedMarkdownTextProps extends Omit<ViewProps, 'style'> {
    * @platform ios, android, web
    */
   onCodeBlockPress?: (event: CodeBlockPressEvent) => void;
+  /**
+   * Shows a line wrap toggle next to the copy button in each fenced code block
+   * header; set `false` to hide it. Every block starts unwrapped (horizontal scroll) and toggles on its
+   * own. The state belongs to the block's position in the document: it survives
+   * streaming appends and resets when the markdown is replaced. Code blocks
+   * inside blockquotes and admonitions get the toggle too. The toggle's spoken
+   * labels come from `accessibilityLabels.codeBlock`.
+   *
+   * Only applies when `flavor="github"`.
+   * @default true
+   * @platform ios, android
+   */
+  enableCodeBlockWrapToggle?: boolean;
   /**
    * Controls the long-press context menu on block views (code blocks, tables,
    * and block math). When false, long-pressing a block does not open the copy

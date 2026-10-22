@@ -16,6 +16,7 @@ import com.swmansion.enriched.markdown.styles.CodeStyle
 import com.swmansion.enriched.markdown.styles.HeadingStyle
 import com.swmansion.enriched.markdown.styles.HighlightStyle
 import com.swmansion.enriched.markdown.styles.LinkStyle
+import com.swmansion.enriched.markdown.styles.ListStyle
 import com.swmansion.enriched.markdown.styles.ParagraphStyle
 import com.swmansion.enriched.markdown.styles.SpoilerStyle
 import com.swmansion.enriched.markdown.styles.StrikethroughStyle
@@ -101,6 +102,12 @@ object MarkdownRenderTestSupport {
     )
   }
 
+  /** [defaultStyle] with its [ListStyle] and, when given, its [TaskListStyle] replaced. */
+  fun styleWithList(
+    listStyle: ListStyle,
+    taskListStyle: TaskListStyle? = null,
+  ): StyleConfig = copyOfDefault(listStyle = listStyle, taskListStyle = taskListStyle)
+
   /** [defaultStyle] with only its [TaskListStyle] replaced. */
   fun styleWithTaskList(taskListStyle: TaskListStyle): StyleConfig = copyOfDefault(taskListStyle = taskListStyle)
 
@@ -111,6 +118,7 @@ object MarkdownRenderTestSupport {
     strikethroughStyle: StrikethroughStyle? = null,
     underlineStyle: UnderlineStyle? = null,
     highlightStyle: HighlightStyle? = null,
+    listStyle: ListStyle? = null,
     taskListStyle: TaskListStyle? = null,
     blockquoteStyle: BlockquoteStyle? = null,
     codeStyle: CodeStyle? = null,
@@ -137,7 +145,7 @@ object MarkdownRenderTestSupport {
       imageStyle = base.imageStyle,
       inlineImageStyle = base.inlineImageStyle,
       blockquoteStyle = blockquoteStyle ?: base.blockquoteStyle,
-      listStyle = base.listStyle,
+      listStyle = listStyle ?: base.listStyle,
       taskListStyle = taskListStyle ?: base.taskListStyle,
       codeBlockStyle = codeBlockStyle ?: base.codeBlockStyle,
       thematicBreakStyle = base.thematicBreakStyle,

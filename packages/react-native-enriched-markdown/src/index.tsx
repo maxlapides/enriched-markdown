@@ -38,6 +38,7 @@ export type {
   EnrichedMarkdownTextInputInstance,
   MarkdownTextInputStyle,
   StyleState,
+  HistoryState,
   ContextMenuItem,
   InputSelectionMenuConfig,
   FormatMenuConfig,
