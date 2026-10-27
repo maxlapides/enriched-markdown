@@ -61,14 +61,27 @@ describe('input stylesheet', () => {
     ).toEqual(['var(--enrm-link-struck-decoration, underline line-through)']);
   });
 
-  // Review §2.7.3: a fixed 14px box let "10." run into the text.
-  it('anchors ordered markers on their right edge', () => {
+  // Review §2.7.3: a fixed 14px box let "10." run into the text. The edge is
+  // logical so an RTL line puts its number on the right.
+  it('anchors ordered markers on their inline-end edge', () => {
     for (const depth of [0, 2]) {
       const [rule] = rulesFor(
         `.${ENRM_INPUT_CLASS} [data-block="ordered-list-item"][data-depth="${depth}"]::before`
       );
-      expect(rule!.style.getPropertyValue('right')).not.toBe('');
+      expect(rule!.style.getPropertyValue('inset-inline-end')).not.toBe('');
+      expect(rule!.style.getPropertyValue('right')).toBe('');
       expect(rule!.style.getPropertyValue('left')).toBe('');
     }
+  });
+
+  it('indents and marks list lines with logical properties for RTL', () => {
+    const [indent] = rulesFor(`.${ENRM_INPUT_CLASS} [data-depth="0"]`);
+    expect(indent!.style.getPropertyValue('padding-inline-start')).not.toBe('');
+    expect(indent!.style.getPropertyValue('padding-left')).toBe('');
+    const [bullet] = rulesFor(
+      `.${ENRM_INPUT_CLASS} [data-block="unordered-list-item"][data-depth="0"]::before`
+    );
+    expect(bullet!.style.getPropertyValue('inset-inline-start')).not.toBe('');
+    expect(bullet!.style.getPropertyValue('left')).toBe('');
   });
 });

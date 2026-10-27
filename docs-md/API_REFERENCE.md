@@ -30,7 +30,7 @@ Style for the container view.
 
 ### `dir`
 
-Text direction of the root container on web. On iOS and Android use `writingDirection`.
+Text direction on web. Unset or `'auto'`, each block resolves its own direction from its content; `'ltr'` / `'rtl'` force the whole document. See [RTL Support](RTL.md). On iOS and Android use `writingDirection`.
 
 | Type                         | Default Value | Platform |
 | ---------------------------- | ------------- | -------- |

@@ -1,4 +1,5 @@
 import { LIST_ITEM_BLOCK_TYPES } from '../model/blocks';
+import { hasStrongChar } from '../../utils';
 import {
   sameRunStyle,
   type ParagraphProjection,
@@ -351,6 +352,12 @@ function patchBlockAttributes(
   paragraph: ParagraphProjection
 ): void {
   const isListItem = LIST_ITEM_BLOCK_TYPES.has(paragraph.blockType);
+  // Each line picks its direction from its first strong character, as on
+  // native; a line with none gets `dir=""` and inherits the input's direction
+  // (`auto` would resolve it to LTR). Set on patch too, since a line the
+  // browser split off may be reused.
+  const dir = hasStrongChar(paragraph.text) ? 'auto' : '';
+  if (element.getAttribute('dir') !== dir) element.dir = dir;
   setData(
     element,
     'block',

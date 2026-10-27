@@ -14,6 +14,7 @@
     "android",
     "ios",
     "cpp",
+    "common",
     "*.podspec",
     "jest.js",
     "jest.d.ts",
@@ -33,7 +34,8 @@
     "!**/__tests__",
     "!**/__fixtures__",
     "!**/__mocks__",
-    "!**/.*"
+    "!**/.*",
+    "!cpp/tests"
   ],
   "scripts": {
     "postinstall": "node postinstall.mjs",
@@ -147,7 +149,7 @@
   },
   "codegenConfig": {
     "name": "EnrichedMarkdownTextSpec",
-    "type": "components",
+    "type": "all",
     "jsSrcsDir": "src",
     "outputDir": {
       "ios": "ios/generated",
@@ -166,7 +168,13 @@
         },
         "EnrichedMarkdownTextInput": {
           "className": "EnrichedMarkdownTextInput"
+        },
+        "EnrichedMarkdownBlockSlot": {
+          "className": "EnrichedMarkdownBlockSlot"
         }
+      },
+      "modulesProvider": {
+        "EnrichedMarkdownParser": "EnrichedMarkdownParserProvider"
       }
     },
     "includesGeneratedCode": true

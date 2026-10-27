@@ -50,11 +50,11 @@ function listRules(): string {
     const indent = (depth + 1) * LIST_INDENT_PER_DEPTH;
     const markerLeft = depth * LIST_INDENT_PER_DEPTH;
     rules.push(
-      `.${ENRM_INPUT_CLASS} [data-depth="${depth}"] { padding-left: ${indent}px; }`,
-      `.${ENRM_INPUT_CLASS} [data-block="unordered-list-item"][data-depth="${depth}"]::before { left: ${markerLeft + 4}px; ${bulletShape(depth)} }`,
-      // The number grows leftward from a fixed end, as on native, so "10."
-      // and up do not run into the text.
-      `.${ENRM_INPUT_CLASS} [data-block="ordered-list-item"][data-depth="${depth}"]::before { right: calc(100% - ${indent - ORDERED_MARKER_GAP}px); }`
+      `.${ENRM_INPUT_CLASS} [data-depth="${depth}"] { padding-inline-start: ${indent}px; }`,
+      `.${ENRM_INPUT_CLASS} [data-block="unordered-list-item"][data-depth="${depth}"]::before { inset-inline-start: ${markerLeft + 4}px; ${bulletShape(depth)} }`,
+      // The number grows away from the text from a fixed end, as on native,
+      // so "10." and up do not run into the text.
+      `.${ENRM_INPUT_CLASS} [data-block="ordered-list-item"][data-depth="${depth}"]::before { inset-inline-end: calc(100% - ${indent - ORDERED_MARKER_GAP}px); }`
     );
   }
   return rules.join('\n');
@@ -79,7 +79,7 @@ const INPUT_CSS = `
   content: attr(data-placeholder);
   position: absolute;
   top: 0;
-  left: 0;
+  inset-inline-start: 0;
   padding: inherit;
   color: var(--enrm-placeholder-color, #9ca3af);
   pointer-events: none;
@@ -108,7 +108,7 @@ const INPUT_CSS = `
 .${ENRM_INPUT_CLASS} [data-block="ordered-list-item"]::before {
   content: attr(data-ordinal) '.';
   position: absolute;
-  text-align: right;
+  text-align: end;
   white-space: nowrap;
   color: ${defaults.list.markerColor};
   font-weight: ${defaults.list.markerFontWeight};

@@ -313,6 +313,8 @@ export const EnrichedMarkdownText = ({
   contextMenuItems: _contextMenuItems,
   linkContextMenuItems: _linkContextMenuItems,
   imageRequestHeaders: _imageRequestHeaders,
+  renderers: _renderers,
+  resolveImageSource: _resolveImageSource,
   linkPillContent: _linkPillContent,
   selectionMenuConfig: _selectionMenuConfig,
   accessibilityLabels: _accessibilityLabels,

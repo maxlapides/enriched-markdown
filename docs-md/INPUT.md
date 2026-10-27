@@ -284,6 +284,7 @@ No setup is required. Both platforms autodetect direction per paragraph out of t
 
 - **Android** — `EditText` resolves direction per paragraph via `View.TEXT_DIRECTION_FIRST_STRONG` (the platform default). The [`writingDirection`](#writingdirection-prop-ios) prop is accepted but has no effect.
 - **iOS** — TextKit's `NSWritingDirectionNatural` follows the app's global UI layout direction and does not do per-paragraph first-strong. The library applies first-strong itself after every formatting pass. The mode is controlled by [`writingDirection`](#writingdirection-prop-ios) and defaults to `'first-strong'`.
+- **Web** — each line with a letter gets `dir="auto"`, so the browser resolves it from its first strong character; a line with none inherits the input's direction. List indent and markers use CSS logical properties, so they flip on RTL lines.
 
 ### `writingDirection` prop (iOS)
 

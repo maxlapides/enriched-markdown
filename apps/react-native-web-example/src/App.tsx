@@ -104,6 +104,27 @@ console.log(greet("العالم"));
 \`\`\`
 `.trim();
 
+const mixedMarkdown = `
+## Mixed direction
+
+This paragraph is English, so it reads left to right.
+
+هذه الفقرة باللغة العربية، لذلك يجب أن تبدأ من اليمين.
+
+> اقتباس عربي: يجب أن يظهر الحد على الجانب الأيمن.
+
+- عنصر أول في القائمة
+- عنصر ثانٍ مع \`code\`
+
+1. First English step
+2. Second English step
+
+| الاسم | Role |
+| ----- | ---- |
+| أحمد | Developer |
+| Sara | مصمّمة |
+`.trim();
+
 interface EventLog {
   kind: 'link' | 'linkLong' | 'image' | 'task';
   label: string;
@@ -211,6 +232,11 @@ export default function App() {
             dir="rtl"
             onTaskListItemPress={onTaskListItemPress}
           />
+
+          <View style={styles.divider} />
+
+          <SectionLabel>MIXED (NO DIR PROP)</SectionLabel>
+          <EnrichedMarkdownText markdown={mixedMarkdown} />
         </ScrollView>
       )}
 

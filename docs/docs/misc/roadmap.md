@@ -113,8 +113,6 @@ come:
   implementation.
 - **Localizable accessibility strings.** Everything the web renderer speaks is
   hard-coded English today, and `accessibilityLabels` is stripped.
-- **Per-paragraph direction.** Web resolves direction once, at the container
-  level, rather than per paragraph as native does.
 
 ### Shared core
 
